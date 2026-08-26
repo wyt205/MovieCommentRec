@@ -1,0 +1,21 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# ---- 环境变量 / 密钥（含 LLM_API_KEY，切勿提交）----
+.env
+
+# ---- 前端 ----
+node_modules/
+dist/
+frontend/dist/
+
+# ---- 管理端（独立文件夹：默认不提交，需要纳入 git 时删除下一行即可）----
+admin/
+
+# ---- IDE ----
+.idea/
+.vscode/
