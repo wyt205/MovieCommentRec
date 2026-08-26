@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-llm-pro 总启动器
+智影 总启动器
 =================================================================
 一个桌面 GUI（Tkinter，Python 标准库，零额外依赖），用于统一管理
 前后端 / 爬虫 / 预留功能。
@@ -16,7 +16,7 @@ llm-pro 总启动器
   7. 数据爬取（TMDb 公开 API）+ 实时日志 + 进度条：填 Key / 数量 / 关键词即可，自动下载海报
   8. RAG 语义向量库：新增「建立 / 重建语义向量库」按钮，一键跑 backend/build_embeddings.py
      （为 movies 表全部电影切片 + 调用星火 MaaS 嵌入接口生成向量，存入 MySQL 的 movie_embeddings 表）。
-     「管理端」仍为预留（待实现）。
+     「管理端」已激活（独立 admin/ 静态站，可单独 gitignore）。
   9. 智能诊断：后端启动失败 / 前端 vite 缺失时，日志区自动给出排查建议
 
 运行方式（推荐在 llm-pro 虚拟环境中执行）：
@@ -96,7 +96,7 @@ SORT_MAP = {"热度": "popularity.desc", "评分": "vote_average.desc", "最新�
 class LauncherApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("llm-pro 总启动器")
+        self.root.title("智影 总启动器")
         self.root.geometry("660x640")
         self.root.resizable(True, True)
 
@@ -108,7 +108,7 @@ class LauncherApp:
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         ttk.Label(
-            self.root, text="llm-pro 总启动器", font=("Microsoft YaHei", 16, "bold")
+            self.root, text="智影 总启动器", font=("Microsoft YaHei", 16, "bold")
         ).pack(pady=(10, 4))
         ttk.Label(
             self.root,

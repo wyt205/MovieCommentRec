@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-llm-pro 数据库结构迁移（安全，不丢数据）
+智影 数据库结构迁移（安全，不丢数据）
 ========================================
 仅对现有表做 ALTER：补齐 TMDb 相关列（poster / source / tagline / popularity），
 删除豆瓣专属列（star_5~star_1 / douban_id / douban_review_id / douban_url /

@@ -6,7 +6,7 @@ const year = new Date().getFullYear()
   <footer style="border-top:1px solid var(--border);background:#fff;margin-top:40px;">
     <div class="container between" style="padding-top:18px;padding-bottom:18px;">
       <div class="muted text-sm">
-        🎬 llm-pro 影评 · 一个用于演示 Agent + 推荐的电影影评站
+        🎬 智影影评 · 一个用于演示 Agent + 推荐的电影影评站
       </div>
       <div class="row text-sm">
         <RouterLink to="/">电影</RouterLink>

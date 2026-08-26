@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-llm-pro 示例数据种子脚本
+智影 示例数据种子脚本
 ================================
 用法（在 backend 目录下，且已建好 backend/.env）：
     conda activate llm-pro

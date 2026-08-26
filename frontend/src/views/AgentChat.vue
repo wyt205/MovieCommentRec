@@ -6,7 +6,7 @@ import { agentChat } from '../api/agent'
 const sessionId = 'web-' + Math.random().toString(36).slice(2, 10)
 
 const messages = ref([
-  { role: 'bot', text: '你好！我是 llm-pro 智能助手 🤖\n试着问我：「帮我找 2024 年评分最高的喜剧」「《星际穿越》讲了什么」「类似《盗梦空间》的电影」' }
+  { role: 'bot', text: '你好！我是智影智能助手 🤖\n试着问我：「帮我找 2024 年评分最高的喜剧」「《星际穿越》讲了什么」「类似《盗梦空间》的电影」' }
 ])
 const input = ref('')
 const sending = ref(false)

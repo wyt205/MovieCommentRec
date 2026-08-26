@@ -42,7 +42,7 @@ def _seed_genres():
         print(f"[seed] 分类目录播种跳过（请确认 MySQL 已启动）：{e}")
 
 
-app = FastAPI(title="llm-pro 影评 API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="智影 影评 API", version="0.1.0", lifespan=lifespan)
 
 
 @app.exception_handler(Exception)
@@ -77,4 +77,4 @@ if os.path.isdir(STATIC_DIR):
 
 @app.get("/")
 def root():
-    return {"msg": "llm-pro API running", "docs": "/docs"}
+    return {"msg": "智影 API running", "docs": "/docs"}

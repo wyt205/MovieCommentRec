@@ -5,13 +5,13 @@ const stack = [
   ['数据库', 'MySQL 8（电影 / 影评 / 短评 / 评论者）'],
   ['数据源', 'TMDb 官方 API（公开、无反爬、支持中文）'],
   ['海报', '存入数据库 BLOB，经 /api/movies/{id}/poster 回传'],
-  ['计划', '后续接入 LLM Agent（推荐 / 相似 / 剧透护栏 / 闲聊）']
+  ['Agent', '已接入 LangChain 真·Function Calling 自主智能体（推荐 / 检索 / 闲聊 / 身份问答）']
 ]
 </script>
 
 <template>
   <div class="card" style="max-width:760px;margin:0 auto;">
-    <h1 style="margin-top:0;">关于 llm-pro 影评</h1>
+    <h1 style="margin-top:0;">关于智影影评</h1>
     <p style="line-height:1.8;color:#343a40;">
       这是一个用于演示「电影影评 + 智能推荐 Agent」的站点。当前阶段先把影评浏览体验做完整：
       你可以浏览电影、查看详情与影评、搜索与筛选、阅读完整影评。下一步会接入大模型 Agent，

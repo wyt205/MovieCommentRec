@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, r"d:\Study\AI大模型相关\Agent\llm-pro\backend")
+sys.path.insert(0, r"d:\Study\AI大模型相关\Agent\zhiying\backend")
 import app.ai.agent as A
 
 # 临时打桩：记录模型自主调了哪些工具（验证 autonomous agent 行为）。

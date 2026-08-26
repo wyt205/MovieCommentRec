@@ -18,7 +18,7 @@ function onSearch() {
     <div class="container between" style="padding-top:10px;padding-bottom:10px;">
       <div class="row" style="gap:16px;">
         <RouterLink to="/" style="font-weight:700;font-size:18px;color:var(--text);text-decoration:none;">
-          🎬 llm-pro 影评
+          🎬 智影影评
         </RouterLink>
         <nav class="row" style="gap:14px;">
           <RouterLink to="/" class="muted">电影</RouterLink>
