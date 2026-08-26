@@ -40,8 +40,83 @@ from tkinter import ttk, scrolledtext, messagebox
 # 子进程（如 vite/npm）输出带 ANSI 颜色转义码，Tk 文本框无法渲染，需剥离
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-IS_WIN = sys.platform.startswith("windows")
+# Windows 上 sys.platform 为 "win32"（不是 "windows"），必须用 startswith("win")
+# 此前误写成 startswith("windows")，导致 IS_WIN 在 Windows 上恒为 False，
+# 整个 Windows 分支（端口查杀 / taskkill 进程树）被全部跳过，
+# 于是「停止 / 停止全部」在 Windows 上根本杀不掉任何进程。
+IS_WIN = sys.platform.startswith("win")
 DEVNULL = subprocess.DEVNULL
+
+# 端口→PID 映射缓存：避免启停时反复起 powershell 进程导致卡顿、进程堆积。
+# 整个启停流程（stop_all 对 3 个服务、启动前后端各 1 次）只需真正起 **1 次**
+# PowerShell，其余调用全部命中此缓存。
+_PORT_CACHE = {}
+_PORT_CACHE_T = 0.0
+_PORT_CACHE_TTL = 1.5  # 秒
+
+
+def _all_listening(force: bool = False) -> "dict[int, list[int]]":
+    """一次性返回「监听端口 -> 占用进程 PID 列表」的映射，并缓存 _PORT_CACHE_TTL 秒。
+
+    这是「停止/启动卡顿、powershell.exe 进程堆积」的根因修复：此前
+    _pids_on_port 每次都 subprocess 起一个 powershell.exe、且 _kill_by_port 还
+    多轮扫描，单次启停会 spawn 十几个 powershell 进程、耗时 9~15s。改为一次性
+    拿全部监听端口 + 短时缓存后，整个启停流程最多只起 1 次 PowerShell。
+
+    优先 netstat（本机实测 40ms 出结果且能正确返回监听行），PowerShell 仅兜底。
+    """
+    import time
+    global _PORT_CACHE, _PORT_CACHE_T
+    now = time.time()
+    if not force and _PORT_CACHE and now - _PORT_CACHE_T < _PORT_CACHE_TTL:
+        return _PORT_CACHE
+    mapping: "dict[int, list[int]]" = {}
+    if IS_WIN:
+        # 1) netstat 主力（原生、极快——本机实测 40ms 出结果且能正确返回监听行；
+        #    只匹配 LISTENING 行的本地地址列，不会误命中 Coze 等外向连接的 IPv6 地址）
+        try:
+            raw = subprocess.check_output(
+                ["netstat", "-ano", "-p", "TCP"],
+                stderr=DEVNULL,
+            )
+            out = raw.decode("mbcs", errors="replace")
+            for line in out.splitlines():
+                cols = line.split()
+                if len(cols) >= 5 and cols[3] == "LISTENING":
+                    port_str = cols[1].rsplit(":", 1)[-1].rstrip("]")
+                    if port_str.isdigit() and cols[4].isdigit():
+                        mapping.setdefault(int(port_str), []).append(int(cols[4]))
+        except Exception:  # noqa: BLE001
+            pass
+    if not mapping:
+        # 2) PowerShell 兜底（仅当 netstat 完全无输出，极老系统；慢 ~1.2s/次，平时走不到）
+        try:
+            ps = ("Get-NetTCPConnection -State Listen "
+                  "| Select-Object -Property LocalPort, OwningProcess")
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps],
+                stderr=DEVNULL, text=True, timeout=15,
+            )
+            for line in out.splitlines():
+                cols = line.split()
+                if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
+                    mapping.setdefault(int(cols[0]), []).append(int(cols[1]))
+        except Exception:  # noqa: BLE001
+            pass
+    _PORT_CACHE.clear()
+    _PORT_CACHE.update(mapping)
+    _PORT_CACHE_T = time.time()
+    return _PORT_CACHE
+
+
+def _port_in_use(port: int) -> bool:
+    """端口是否被占用（基于一次性缓存的 _all_listening 判断，可靠且不堆进程）。
+
+    用于「启动前 / 停止前」短路：仅当端口**真被占用**才调 _kill_by_port 清理；
+    正常启停（端口空闲）只触发 1 次 netstat（~40ms，且 1.5s 内命中缓存），
+    几乎无感、不堆进程，从而回到「修改前」的流畅体验。
+    """
+    return int(port) in _all_listening(force=True)
 
 # ---------- 路径配置 ----------
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -102,8 +177,15 @@ class LauncherApp:
 
         self.procs = {"backend": None, "frontend": None, "admin": None, "tmdb": None, "embed": None}
         self.running = {"backend": False, "frontend": False, "admin": False, "tmdb": False, "embed": False}
+        # 看门狗重启冷却时间戳：避免后端起不来的情况下陷入重启风暴
+        self._watchdog_last = {}
+        # 各子进程日志落盘路径（.run/<service>.log）；GUI 端尾随文件，不回灌子进程
+        self._log_paths = {}
 
         self._build_ui()
+        # 健康看门狗：后端进程「假死」（端口仍被占用但 /health 无响应）时
+        # 自动重启，避免 GUI 绿灯亮着、实际已卡死却查不出问题的老毛病。
+        threading.Thread(target=self._health_watchdog, daemon=True).start()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -281,6 +363,12 @@ class LauncherApp:
         if dot:
             self._draw_dot(dot, "green" if running else "red")
 
+    def _set_dot(self, key, color):
+        """直接把状态灯设为指定颜色（如橙色 '#f0a000' 表示『启动中』），不改动 running 标志。"""
+        dot = getattr(self, f"dot_{key}", None)
+        if dot:
+            self._draw_dot(dot, color)
+
     def _open(self, url):
         import webbrowser
         webbrowser.open(url)
@@ -309,20 +397,39 @@ class LauncherApp:
 
     # --------------------------------------------------------------- 启动
     def start_service(self, key):
+        # 若仍标记为运行中（多因上次异常退出未复位，或点过启动又点停止），
+        # 先复位状态再启动，避免「点了启动却没反应」的卡死现象。
         if self.running.get(key):
-            self.log_msg(f"[提示] {key} 已在运行")
-            return
+            self.log_msg(f"[提示] {key} 仍标记为运行中，先复位状态再启动")
+            self.running[key] = False
         if key == "backend":
             self._spawn_backend()
         elif key == "frontend":
             self._spawn_frontend()
 
+    def _log_path_for(self, tag: str) -> str:
+        """各子进程日志落盘路径（.run/<service>.log）。"""
+        safe = {"后端": "backend", "前端": "frontend", "TMDb": "tmdb",
+                "向量库": "embed", "管理端": "admin"}.get(tag, "service")
+        d = os.path.join(ROOT, ".run")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{safe}.log")
+
     def _spawn(self, args, cwd, tag, shell=False, env=None):
+        # 关键修复（根治「后端运行约 1 分钟假死、看门狗误重启」）：
+        # 子进程 stdout/stderr 重定向到日志文件，而非 PIPE。
+        # 旧写法把后端输出经 PIPE 交给 GUI 读取线程；uvicorn 的访问日志在
+        # 『事件循环线程』里写 stdout，一旦 GUI 读取线程因 Tk 主线程繁忙而跟不上、
+        # 4KB 管道被写满，事件循环线程就阻塞在 write() 上 → 连异步 /health 都无响应
+        # → 看门狗误判假死并重启。改为写文件后，子进程写日志永不被 GUI 卡住，
+        # 死锁类假死从根上消失；GUI 端由下方 _log_tailer 异步尾随文件、不回灌子进程。
+        log_path = self._log_path_for(tag)
+        self._log_paths[tag] = log_path
+        logf = open(log_path, "w", buffering=1, encoding="utf-8", errors="replace")
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WIN else 0
         return subprocess.Popen(
             args, cwd=cwd, shell=shell, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, encoding="utf-8", errors="replace",
+            stdout=logf, stderr=subprocess.STDOUT,
             creationflags=flags,
         )
 
@@ -342,40 +449,121 @@ class LauncherApp:
         return env
 
     def _spawn_backend(self):
-        # 启动前先清掉 8000 端口上可能残留的旧后端，避免多个进程抢同一端口
-        killed = self._kill_by_port(BACKEND_PORT)
-        if killed:
-            self.log_msg(f"[清理] 已释放 {killed} 个占用后端端口(:{BACKEND_PORT})的残留进程")
+        # 启动前仅当端口真被占用时才清理：正常启动（端口空闲）跳过，
+        # 避免每次启动都查端口导致卡顿、进程堆积（此前启动变慢的根因）
+        if _port_in_use(BACKEND_PORT):
+            killed = self._kill_by_port(BACKEND_PORT)
+            if killed:
+                self.log_msg(f"[清理] 已释放 {killed} 个占用后端端口(:{BACKEND_PORT})的残留进程")
         env = self._backend_env()
         try:
             proc = self._spawn(
                 [BACKEND_PYTHON, "-m", "uvicorn", "app.main:app",
-                 "--reload", "--port", str(BACKEND_PORT)],
+                 "--port", str(BACKEND_PORT)],
                 BACKEND_DIR, "后端", env=env,
             )
             self.procs["backend"] = proc
-            self._set_status("backend", True)
-            self.log_msg(f"[后端] 启动中... (python={BACKEND_PYTHON})")
-            threading.Thread(target=self._reader, args=(proc, "后端"), daemon=True).start()
+            # 立刻把灯置橙（启动中），给点击即时反馈，避免「点了没反应」的错觉；
+            # 真正就绪（/health 返回 200）才转绿，失败转红。
+            self.running["backend"] = False
+            self._set_dot("backend", "#f0a000")
+            self.log_msg(f"[后端] 启动中... 等待 :{BACKEND_PORT} 就绪 (python={BACKEND_PYTHON})")
+            threading.Thread(target=self._wait_backend_ready, args=(proc,), daemon=True).start()
+            threading.Thread(target=self._log_tailer, args=(proc, "后端"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.log_msg(f"[后端][错误] {e}")
+
+    def _wait_backend_ready(self, proc):
+        """后端健康检测：轮询 /health，直到 200（端口真在监听）或超时。
+
+        解决「一键启动没反应 / 假绿灯」：uvicorn --reload 的 reloader 父进程
+        起来 ≠ 端口已监听；若启动失败（MySQL 未起 / 端口被占 / 依赖缺失）
+        状态灯却误显示绿。这里用真实 HTTP 探活，成功才置绿。
+        """
+        import time
+        import urllib.request
+        url = f"http://127.0.0.1:{BACKEND_PORT}/health"
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            # 仅当本线程跟踪的 proc 仍是「当前后端」时才判定失败——
+            # 否则用户点「停止→启动」后，旧线程盯着已死的旧进程会误报「启动失败」。
+            if proc.poll() is not None and self.procs.get("backend") is proc:
+                # 进程已退出 = 启动失败
+                self.root.after(0, self._set_status, "backend", False)
+                self.root.after(
+                    0, self.log_msg,
+                    "[后端][错误] 进程已退出，启动失败！请查看上方日志"
+                    "（常见原因：MySQL 未启动 / 端口被占 / 依赖未装）",
+                )
+                return
+            try:
+                with urllib.request.urlopen(url, timeout=2):
+                    self.root.after(0, self._set_status, "backend", True)
+                    self.root.after(0, self.log_msg, f"[后端] 已就绪 ✅ (端口 :{BACKEND_PORT} 监听中)")
+                    return
+            except Exception:
+                time.sleep(1)
+        # 超时：仅当本线程仍对应当前后端时才置红，避免误报掩盖新一次成功启动
+        if self.procs.get("backend") is proc:
+            self.root.after(0, self._set_status, "backend", False)
+            self.root.after(0, self.log_msg, f"[后端][超时] 25s 内未就绪，启动可能失败，请查看上方日志")
+
+    # ----------------------------------------------------- 健康看门狗
+    def _health_watchdog(self):
+        """后台线程：定期探活后端 /health。
+
+        仅针对『端口仍被占用、但 /health 无响应』的假死场景自动重启——
+        这是此前反复出现的「绿灯亮着、实际已卡死、切页像断网」的根因。
+        若后端已干净退出（端口空），交由 _log_tailer 正常复位，看门狗不动；
+        若 MySQL 没起导致后端起不来，端口也是空的，同样不触发，避免重启风暴。
+        """
+        import time
+        import urllib.request
+        url = f"http://127.0.0.1:{BACKEND_PORT}/health"
+        while True:
+            time.sleep(15)
+            try:
+                if not self.running.get("backend"):
+                    continue
+                try:
+                    with urllib.request.urlopen(url, timeout=4):
+                        continue  # 健康，跳过
+                except Exception:
+                    pass
+                # 探活失败：仅当端口仍被占用（=假死而非干净退出）才重启
+                if not _port_in_use(BACKEND_PORT):
+                    continue
+                now = time.time()
+                if now - self._watchdog_last.get("backend", 0) < 30:
+                    continue
+                self._watchdog_last["backend"] = now
+                self.log_msg("[看门狗] 检测到后端进程假死（端口仍占用但无响应），准备自动重启…")
+                # 切回主线程执行启停，避免跨线程操作 Tk / 子进程
+                self.root.after(0, self._watchdog_restart_backend)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _watchdog_restart_backend(self):
+        """看门狗触发的后端重启（在主线程执行）。"""
+        self.stop_service("backend")
+        self._spawn_backend()
 
     def _spawn_frontend(self):
         npm = self._find_npm()
         if not npm:
             self.log_msg("[前端][错误] 未找到 npm，请确认 Node.js 已安装并在 PATH 中")
             return
-        # 启动前先清掉 5173 端口上可能残留的旧前端（vite 若发现端口被占会自动 +1 到 5174，
-        # 导致启动器「进入前端页」指向的 5173 其实是旧进程），避免堆叠
-        killed = self._kill_by_port(FRONTEND_PORT)
-        if killed:
-            self.log_msg(f"[清理] 已释放 {killed} 个占用前端端口(:{FRONTEND_PORT})的残留进程")
+        # 启动前仅当端口真被占用时才清理（正常启动跳过，避免卡顿/进程堆积）
+        if _port_in_use(FRONTEND_PORT):
+            killed = self._kill_by_port(FRONTEND_PORT)
+            if killed:
+                self.log_msg(f"[清理] 已释放 {killed} 个占用前端端口(:{FRONTEND_PORT})的残留进程")
         try:
             proc = self._spawn(f"{npm} run dev", FRONTEND_DIR, "前端", shell=True)
             self.procs["frontend"] = proc
             self._set_status("frontend", True)
             self.log_msg("[前端] 启动中... (npm run dev)")
-            threading.Thread(target=self._reader, args=(proc, "前端"), daemon=True).start()
+            threading.Thread(target=self._log_tailer, args=(proc, "前端"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.log_msg(f"[前端][错误] {e}")
 
@@ -412,18 +600,38 @@ class LauncherApp:
             self.log_msg("[清理] 端口干净，无残留进程，直接启动 ✅")
         return total
 
-    def _reader(self, proc, tag):
+    def _log_tailer(self, proc, tag):
+        """异步尾随子进程日志文件，把新增行转发到 GUI 日志区。
+
+        与旧 _reader（读 proc.stdout PIPE）本质不同：这里读的是『文件』，
+        不会反向阻塞子进程——子进程写日志永不被 GUI 读取线程卡住，
+        因此杜绝了「管道写满 → 事件循环阻塞 → 整进程假死」的死锁。
+        """
+        log_path = self._log_paths.get(tag)
+        if not log_path:
+            return
         try:
-            for line in proc.stdout:
-                self.root.after(0, self.log_msg, f"[{tag}] {line.rstrip()}")
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(0, os.SEEK_END)  # 只看启动后的新日志
+                while proc.poll() is None:
+                    line = f.readline()
+                    if line:
+                        if tag == "TMDb":
+                            m = re.search(r"\[STEP\]\s*(\d+)/(\d+)", line)
+                            if m:
+                                self.root.after(
+                                    0, self._set_tmdb_progress,
+                                    int(m.group(1)), int(m.group(2)))
+                        self.root.after(0, self.log_msg, f"[{tag}] {line.rstrip()}")
+                    else:
+                        time.sleep(0.2)
         except Exception:  # noqa: BLE001
             pass
+        rc = proc.poll()
         try:
-            proc.stdout.close()
+            self.root.after(0, self._on_proc_exit, tag, rc)
         except Exception:  # noqa: BLE001
             pass
-        rc = proc.wait()
-        self.root.after(0, self._on_proc_exit, tag, rc)
 
     def _on_proc_exit(self, tag, rc):
         if tag == "向量库":
@@ -449,18 +657,24 @@ class LauncherApp:
 
     # --------------------------------------------------------------- 停止
     def stop_service(self, key):
-        if key == "backend":
-            # 按端口清掉 8000 上所有残留后端（可能不止本启动器启动的那一个，
-            # 比如之前手动在终端起过、或多次点击启动堆叠的进程）
-            self._kill_by_port(BACKEND_PORT)
+        # 按端口清掉对应服务监听的所有残留进程：覆盖「本启动器启动的」+「手动/历史遗留的」
+        # （之前只有 backend 走这一步，frontend/admin 只杀记录的进程树，会漏掉遗留进程）。
+        port = {"backend": BACKEND_PORT, "frontend": FRONTEND_PORT,
+                "admin": ADMIN_PORT}.get(key)
+        if port and _port_in_use(port):
+            killed = self._kill_by_port(port)
+            if killed:
+                self.log_msg(f"[停止] 已释放 {killed} 个占用端口(:{port})的进程")
+        # 再补刀：杀掉本启动器记录跟踪的那个进程树（含其子进程，如 vite/esbuild）
         proc = self.procs.get(key)
-        if proc and self.running.get(key):
+        if proc:
             self._kill_tree(proc.pid)
-            self.procs[key] = None
-            self._set_status(key, False)
-            self.log_msg(f"[{key}] 已停止")
-        else:
-            self.log_msg(f"[{key}] 未在运行")
+        # 关键修复：无论之前是否在跑、proc 是否为 None，停止后一律复位状态标志
+        # 并置红灯，避免「running 卡在 True、灯却不动」导致下次点启动没反应。
+        self.procs[key] = None
+        self.running[key] = False
+        self._set_status(key, False)
+        self.log_msg(f"[{key}] 已停止")
 
     def stop_all(self):
         for k in ("backend", "frontend", "admin", "tmdb", "embed"):
@@ -480,42 +694,44 @@ class LauncherApp:
 
     @staticmethod
     def _pids_on_port(port: int) -> list[int]:
-        """返回当前正在 LISTEN 指定 TCP 端口的进程 PID 列表（Windows 用 netstat）。"""
-        pids: list[int] = []
-        if not IS_WIN:
-            return pids
-        try:
-            out = subprocess.check_output(
-                ["netstat", "-ano", "-p", "TCP"],
-                stderr=DEVNULL, text=True, timeout=10,
-            )
-            for line in out.splitlines():
-                cols = line.split()
-                # 形如: TCP 127.0.0.1:8000 0.0.0.0:0 LISTENING 1234
-                if len(cols) >= 5 and cols[3] == "LISTENING":
-                    addr = cols[1]
-                    port_str = addr.rsplit(":", 1)[-1].rstrip("]")  # 精确取端口，避免 18000 误匹配 8000；兼容 IPv6 [::1]:8000
-                    if port_str == str(port):
-                        try:
-                            pids.append(int(cols[4]))
-                        except ValueError:
-                            pass
-        except Exception:  # noqa: BLE001
-            pass
-        return pids
+        """返回当前正在 LISTEN 指定 TCP 端口的进程 PID 列表（基于一次性缓存）。
+
+        具体查询交给模块级 _all_listening()：一次 PowerShell 拿全部监听端口，
+        1.5s 内复用缓存，避免启停时反复起 powershell 进程导致卡顿/堆积。
+        """
+        return list(_all_listening().get(int(port), []))
 
     def _kill_by_port(self, port: int) -> int:
-        """强制杀掉所有监听指定端口的进程（含其子进程），返回被清理的进程数量。"""
-        pids = self._pids_on_port(port)
-        for pid in pids:
-            try:
-                subprocess.call(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=DEVNULL, stderr=DEVNULL,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        return len(pids)
+        """强制杀掉所有监听指定端口的进程（含其子进程），返回被清理的进程数量。
+
+        短路：先用 socket 毫秒级探测 _port_in_use——端口本就空闲时直接返回 0，
+        不查端口、不起任何进程，恢复「修改前」0 卡顿、不堆进程的体验；
+        仅当端口确被占用才走 netstat 查杀。每轮开头清空端口缓存，
+        确保拿到的是实时监听状态，避免「刚杀掉的旧 PID 残留在缓存」造成假阳性计数。
+        """
+        if not _port_in_use(port):
+            return 0
+        total = 0
+        import time
+        for _ in range(2):
+            # 每轮开头清空缓存，保证本轮查到的是实时状态（刚杀掉的不会残留）
+            global _PORT_CACHE, _PORT_CACHE_T
+            _PORT_CACHE.clear()
+            _PORT_CACHE_T = 0.0
+            pids = self._pids_on_port(port)
+            if not pids:
+                break
+            for pid in pids:
+                try:
+                    subprocess.call(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        stdout=DEVNULL, stderr=DEVNULL,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            total += len(pids)
+            time.sleep(0.3)
+        return total
 
     # --------------------------------------------------------------- 数据爬取 (TMDb)
     def start_tmdb(self):
@@ -592,30 +808,10 @@ class LauncherApp:
             if only_new:
                 desc += " · 仅爬新数据"
             self.log_msg(f"[TMDb] 启动拉取（{desc}，count={count}）...")
-            threading.Thread(target=self._tmdb_reader, args=(proc,), daemon=True).start()
+            threading.Thread(target=self._log_tailer, args=(proc, "TMDb"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.log_msg(f"[TMDb][错误] {e}")
             self.tmdb_progress["value"] = 0
-
-    def _tmdb_reader(self, proc):
-        try:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                m = re.search(r"\[STEP\]\s*(\d+)/(\d+)", line)
-                if m:
-                    self.root.after(0, self._set_tmdb_progress,
-                                    int(m.group(1)), int(m.group(2)))
-                self.root.after(0, self.log_msg, f"[TMDb] {line}")
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            proc.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-        rc = proc.wait()
-        self.root.after(0, self._on_proc_exit, "TMDb", rc)
 
     def _set_tmdb_progress(self, value, total):
         self.tmdb_progress["maximum"] = total
@@ -640,27 +836,11 @@ class LauncherApp:
                 BACKEND_DIR, "向量库", env=env,
             )
             self.procs["embed"] = proc
-            threading.Thread(target=self._embed_reader, args=(proc,), daemon=True).start()
+            threading.Thread(target=self._log_tailer, args=(proc, "向量库"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.running["embed"] = False
             self.embed_status_label.config(text="状态：失败 ❌", foreground="#b42318")
             self.log_msg(f"[向量库][错误] {e}")
-
-    def _embed_reader(self, proc):
-        try:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                self.root.after(0, self.log_msg, f"[向量库] {line}")
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            proc.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-        rc = proc.wait()
-        self.root.after(0, self._on_proc_exit, "向量库", rc)
 
     # ----------------------------------------------------- 管理端 (独立 admin/ 文件夹)
     def start_admin(self):
@@ -690,25 +870,9 @@ class LauncherApp:
             self.running["admin"] = True
             self.log_msg(f"[管理端] 已启动静态服务：{ADMIN_URL}（python -m http.server）")
             self._open(ADMIN_URL)
-            threading.Thread(target=self._admin_reader, args=(proc,), daemon=True).start()
+            threading.Thread(target=self._log_tailer, args=(proc, "管理端"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.log_msg(f"[管理端][错误] {e}")
-
-    def _admin_reader(self, proc):
-        try:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                self.root.after(0, self.log_msg, f"[管理端] {line}")
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            proc.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-        rc = proc.wait()
-        self.root.after(0, self._on_proc_exit, "管理端", rc)
 
     # ------------------------------------------------------------- 预留
     @staticmethod

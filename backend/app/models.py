@@ -145,3 +145,30 @@ class AgentTrace(Base):
     used_guardrail = Column(Boolean, default=False, comment="是否触发护栏强制重试")
     cache_hit = Column(Boolean, default=False, comment="是否命中响应缓存")
     created_at = Column(DateTime, server_default=func.now())
+
+
+class ChatSession(Base):
+    """Agent 对话会话：每次「新建对话」一条记录，messages 存完整对话历史（JSON）。
+    由 agent 的 DBChatMessageHistory 自动读写，因此切换页面 / 重启前后端都不丢，
+    并支撑前端「左侧对话记录列表」（可继续聊 / 删除）。"""
+
+    __tablename__ = "chat_sessions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), unique=True, nullable=False, index=True, comment="会话唯一 id（前端持有）")
+    title = Column(String(255), default="新对话", comment="会话标题（取首条用户消息前 24 字）")
+    messages = Column(JSON, default=list, comment="对话历史 [{role, text, ts}]")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class UserPreference(Base):
+    """用户长期偏好（轻量 KV）：目前存电影类型喜好，供 agent 推荐时主动参考。
+    key 如 fav_genres / disliked_genres，value 为字符串列表。"""
+
+    __tablename__ = "user_preferences"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    key = Column(String(64), unique=True, nullable=False)
+    value = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

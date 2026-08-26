@@ -155,7 +155,12 @@ def find_movies(genre: str = "", year: int = 0, country: str = "",
                 if v
             )
             return f"未找到符合条件（{cond or '全部'}）的电影。"
-        lines = [f"找到 {len(rows)} 部电影（按{sort}排序）："]
+        # 真实总条数（不受 limit 截断影响），供「诚实告知缺量」使用——
+        # 例如库里实际有 20 部动画、用户只要 2 部时，这里报 20 而非被截断后的 2。
+        total = crud.count_movies(
+            db, genre=genre_merged, year=year or None, country=country or None
+        )
+        lines = [f"找到 {len(rows)} 部电影（按{sort}排序，共 {total} 部符合条件）："]
         for m in rows:
             pop = f" 热度:{m.popularity}" if m.popularity is not None else ""
             lines.append(

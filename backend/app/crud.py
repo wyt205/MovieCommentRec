@@ -82,6 +82,26 @@ def get_movies(db: Session, skip: int = 0, limit: int = 20, keyword: str | None 
     return q.offset(skip).limit(limit).all()
 
 
+def count_movies(db: Session, genre: str | None = None, year: int | None = None,
+                 country: str | None = None) -> int:
+    """返回符合 类型/年份/地区 组合的「真实总条数」（不受 limit 影响）。
+
+    与 get_movies 用同一套过滤逻辑，但只 COUNT 不返回行。供「诚实告知缺量」用——
+    例如用户要 5 部、库里只有 4 部时，必须报真实的 4 而不是被 limit 截断后的数字。
+    """
+    q = db.query(models.Movie)
+    if genre:
+        parts = [g.strip() for g in str(genre).replace("，", ",").split(",") if g.strip()]
+        for g in parts:
+            q = q.filter(models.Movie.genres.contains(g))
+    if year:
+        q = q.filter(models.Movie.year == year)
+    if country:
+        country_en = COUNTRY_ALIAS.get(country.strip(), country.strip())
+        q = q.filter(models.Movie.country.contains(country_en))
+    return q.count()
+
+
 def get_movie(db: Session, movie_id: int):
     return db.get(models.Movie, movie_id)
 

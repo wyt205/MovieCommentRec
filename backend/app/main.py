@@ -1,12 +1,14 @@
 from contextlib import asynccontextmanager
 import os
+import threading
+
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import movies, reviews, genres, agent, admin
+from app.api import movies, reviews, genres, agent, admin, sessions
 from app.db.database import Base, engine, SessionLocal
 
 from app import models  # 确保模型被加载，create_all 才能建表；同时把 models 名绑进作用域供播种使用
@@ -23,6 +25,9 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     # 幂等播种分类目录（TMDb 官方 19 个类型）
     _seed_genres()
+    # 海报预热：后台把全部海报 BLOB 落盘到 static/posters/，
+    # 使首页/分类页首屏直接从磁盘秒出，不占线程池、不查库。
+    threading.Thread(target=movies.warm_posters, daemon=True).start()
     yield
 
 
@@ -69,10 +74,21 @@ app.include_router(reviews.router, prefix="/api")
 app.include_router(genres.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
+app.include_router(sessions.router, prefix="/api")
 
 # 托管本地图片（海报等）：浏览器访问 /static/posters/1292052.svg
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/health")
+async def health():
+    """启动器 / 存活探针用：返回 200 即代表 uvicorn 已真的在监听端口。
+
+    改成 async：确保即使线程池被 DB 慢查询暂时占满，探针仍能在事件循环里
+    立即响应（def 版会去抢线程池线程，线程池满时就会跟着一起卡死）。
+    """
+    return {"status": "ok"}
 
 
 @app.get("/")

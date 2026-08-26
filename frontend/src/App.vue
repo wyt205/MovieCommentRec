@@ -7,9 +7,11 @@ import AppFooter from './components/AppFooter.vue'
   <NavBar />
   <main class="container" style="padding-top:76px;">
     <router-view v-slot="{ Component }">
-      <transition name="fade" mode="out-in">
-        <component :is="Component" />
-      </transition>
+      <keep-alive include="AgentChat">
+        <transition name="fade" mode="out-in">
+          <component :is="Component" />
+        </transition>
+      </keep-alive>
     </router-view>
   </main>
   <AppFooter />
