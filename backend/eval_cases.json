@@ -1,40 +1,34 @@
 [
-  {"id": "L01", "type": "library", "query": "你知道《你的名字。》吗", "target": "你的名字。"},
-  {"id": "L02", "type": "library", "query": "给我讲讲《千与千寻》", "target": "千与千寻"},
-  {"id": "L03", "type": "library", "query": "《安昂传奇》讲的是什么", "target": "安昂传奇"},
-  {"id": "L04", "type": "library", "query": "介绍一下《肖申克的救赎》", "target": "肖申克的救赎"},
-  {"id": "L05", "type": "library", "query": "《蝙蝠侠：黑暗骑士》的导演是谁", "target": "蝙蝠侠"},
-  {"id": "L06", "type": "library", "query": "《鬼灭之刃》这部片子怎么样", "target": "鬼灭之刃"},
+  {"id": "L01", "type": "library", "query": "《千与千寻》讲的是一个什么故事？", "target": "千与千寻"},
+  {"id": "L02", "type": "library", "query": "帮我介绍一下《肖申克的救赎》，它大概讲了啥", "target": "肖申克的救赎"},
 
-  {"id": "R01", "type": "refusal", "query": "你知道《复仇者联盟》吗", "target": "复仇者联盟"},
-  {"id": "R02", "type": "refusal", "query": "《泰坦尼克号》讲啥", "target": "泰坦尼克号"},
-  {"id": "R03", "type": "refusal", "query": "推荐一下《阿凡达》", "target": "阿凡达"},
-  {"id": "R04", "type": "refusal", "query": "我想看《超能陆战队》", "target": "超能陆战队"},
-  {"id": "R05", "type": "refusal", "query": "《流浪地球》好看吗", "target": "流浪地球"},
-  {"id": "R06", "type": "refusal", "query": "讲讲《盗梦空间》", "target": "盗梦空间"},
+  {"id": "R01", "type": "refusal", "query": "《复仇者联盟》好看吗？给我讲讲它的剧情", "target": "复仇者联盟"},
+  {"id": "R02", "type": "refusal", "query": "推荐一下《阿凡达》，顺便说说它的导演是谁", "target": "阿凡达"},
 
-  {"id": "C01", "type": "chat", "query": "你好啊"},
-  {"id": "C02", "type": "chat", "query": "在吗"},
-  {"id": "C03", "type": "chat", "query": "今天天气真不错"},
+  {"id": "C01", "type": "chat", "query": "你好呀，在不在？"},
+  {"id": "C02", "type": "chat", "query": "今天有点累，陪我随便聊两句吧"},
 
-  {"id": "I01", "type": "identity", "query": "你是谁"},
-  {"id": "I02", "type": "identity", "query": "你叫什么名字"},
-  {"id": "I03", "type": "identity", "query": "介绍一下你自己"},
+  {"id": "I01", "type": "identity", "query": "你是谁？叫什么名字？"},
+  {"id": "I02", "type": "identity", "query": "你是真人吗，还是程序？"},
 
-  {"id": "D01", "type": "defer", "query": "你先别急，我还没想好要什么类型的"},
-  {"id": "D02", "type": "defer", "query": "等一下，我待会告诉你要求"},
+  {"id": "D01", "type": "defer", "query": "你先别急，我还没想好要看什么类型的"},
+  {"id": "D02", "type": "defer", "query": "等一下，我待会再告诉你我的具体要求"},
 
-  {"id": "G01", "type": "genre", "query": "推荐几部刺激的电影", "expect_genre": "动作"},
-  {"id": "G02", "type": "genre", "query": "有没有搞笑的片子", "expect_genre": "喜剧"},
-  {"id": "G03", "type": "genre", "query": "吓人的电影有吗", "expect_genre": "恐怖"},
-  {"id": "G04", "type": "genre", "query": "想看烧脑的科幻", "expect_genre": "科幻"},
+  {"id": "G01", "type": "genre", "query": "想看部特别刺激的动作片，有推荐吗", "expect_genre": "动作"},
+  {"id": "G02", "type": "genre", "query": "有没有轻松搞笑的喜剧片可以看", "expect_genre": "喜剧"},
 
   {"id": "M01", "type": "multi_dim", "query": "分别推荐评分最高和热度最高的各一部"},
+  {"id": "M02", "type": "multi_dim", "query": "评分第一的电影和人气最旺的电影，各来一部"},
 
-  {"id": "N01", "type": "neg_genre", "query": "推荐点不要动画的爱情片", "exclude": "动画", "expect_in": "爱情"},
+  {"id": "F01", "type": "fuzzy", "query": "奇幻大冒险那部动画片讲的是什么来着", "target": "奇幻变身大冒险"},
+  {"id": "F02", "type": "fuzzy", "query": "有部电影好像叫「最后的什么宗」，气宗？是讲什么的", "target": "安昂传奇：最后的气宗"},
 
-  {"id": "F01", "type": "fuzzy", "query": "奇幻大冒险讲的是什么", "target": "奇幻变身大冒险"},
+  {"id": "T01", "type": "title_fragment", "query": "标题里带「气宗」两个字的电影叫什么", "fragment": "气宗"},
+  {"id": "T02", "type": "title_fragment", "query": "哪部片子名字里有「千寻」这两个字", "fragment": "千寻"},
 
-  {"id": "S01", "type": "semantic", "query": "讲时间循环的电影"},
-  {"id": "S02", "type": "semantic", "query": "结局很治愈的电影"}
+  {"id": "MEM01", "type": "memory_followup", "turns": ["推荐一部爱情电影", "再推荐一部"], "expect_genre": "爱情"},
+  {"id": "MEM02", "type": "memory_followup", "turns": ["推荐一部悬疑片", "换一个"], "expect_genre": "悬疑"},
+
+  {"id": "S01", "type": "semantic", "query": "讲时间循环的电影有哪些"},
+  {"id": "S02", "type": "semantic", "query": "想看「治愈系」的片子，看完心里暖暖的那种"}
 ]

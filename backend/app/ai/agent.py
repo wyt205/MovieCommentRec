@@ -18,6 +18,7 @@
 """
 
 import json
+import os
 import re
 import time
 import threading
@@ -34,6 +35,11 @@ from app import crud
 from app.db.database import SessionLocal
 from app.models import AgentTrace, ChatSession, UserPreference
 from app.runtime_flags import is_autonomous
+
+# 评测严谨化：允许通过环境变量固定 LLM temperature。
+# 默认 0.3（给正常对话留一点自然度）；run_eval.py 跑评测时会设 AGENT_LLM_TEMPERATURE=0，
+# 关闭随机性 → 输出确定性、可复现，评测分数稳定、两次跑可直接对比（否则免费模型非确定性会让分数抖动）。
+LLM_TEMPERATURE = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.3"))
 
 SYSTEM_PROMPT = """你是智影影评网站的智能助手。
 - 使用提供的工具查询真实数据库，来回答用户关于电影、影评、推荐的问题。
@@ -137,10 +143,21 @@ def _classify_intent(message: str) -> str:
     # 3) 推荐/找片诉求（含「推荐/想看/找/有什么」等）→ 走工具路由，务必先查库
     if any(k in m for k in _RECOMMEND_KW):
         return "recommend"
+    # 3.5) 续轮推荐（换一个/还有吗/再来一部/再推荐…）：即使不含电影信号词，
+    #      也是明确的「再要一部」诉求（要继承上一轮类型），绝不能当闲聊——
+    #      否则会退化成纯 LLM 凭训练记忆瞎推库外电影（如「换一个」→ 编出《消失的她》）。
+    #      注意放在 纯问候/感谢 之前，避免「好的，换一个吧」被「好的」短路成闲聊。
+    if _is_followup(m):
+        return "recommend"
     # 4) 上面都不是 → 才当作纯问候/感谢/闲聊（此时已排除所有电影/身份信号，安全）
     if any(k in m for k in _THANKS_KW) or any(k in m for k in _GREET_KW):
         return "chat"
-    return "movie_related"
+    # 5) 兜底：含电影信号（电影/类型/影评/评分/看过…）→ 走电影分支；
+    #    完全不含任何电影信号（如「今天有点累」「讲个笑话」）→ 纯闲聊，交 LLM 自然回应，
+    #    避免把日常闲聊误判成「找电影」而推一屏幕评分最高电影（用户实测反馈）。
+    if any(k in m for k in _MOVIE_SIGNAL_KW):
+        return "movie_related"
+    return "chat"
 
 
 # —— 会话历史（DB-backed）——
@@ -301,16 +318,23 @@ def _get_last_find(sid: str) -> dict:
         return dict(_SESSION_LAST_FIND.get(sid, {}))
 
 
-def _set_last_find(sid: str, genre: str, country: str, year, sort: str) -> None:
-    """记录本会话本轮 find 的筛选条件（查库后调用，供续轮继承）。"""
+def _set_last_find(sid: str, genre: str, country: str, year, sort: str,
+                   mode: str = "find", query: str = "") -> None:
+    """记录本会话本轮 find 的筛选条件（查库后调用，供续轮继承）。
+
+    mode/query：记录上一轮是「语义检索」还是「按条件筛选」——续轮「再推荐/换一个」
+    未明说条件时，语义轮继承语义 query（保持主题一致），条件轮继承 genre/country/year/sort。
+    """
     if not sid or sid == "default":
         return
     with _SESSION_LAST_FIND_LOCK:
         _SESSION_LAST_FIND[sid] = {
+            "mode": mode or "find",
             "genre": genre or "",
             "country": country or "",
             "year": year or 0,
             "sort": sort or "",
+            "query": query or "",
         }
 
 
@@ -431,7 +455,8 @@ def _make_llm():
         # 逐 token 产出，配合前端 getReader() 实现真正的逐字流式。
         # （.invoke() 不受影响，仍走普通非流式请求。）
         streaming=True,
-        temperature=0.3,
+        # temperature 由 LLM_TEMPERATURE 常量控制（默认 0.3；评测时由 AGENT_LLM_TEMPERATURE 环境变量覆盖为 0）
+        temperature=LLM_TEMPERATURE,
         # 上限 + 重复惩罚：弱模型（glm-4-flash 免费档）偶发“重复列举”死循环，
         # 导致答案又长又臭、还拖慢首字。硬性限制输出长度，并降低重复概率。
         # 注：repetition_penalty 是智谱在 OpenAI 兼容接口上的专有字段，openai SDK
@@ -521,7 +546,7 @@ def _extract_unknown_movie_name(m: str) -> str | None:
         r"听说过|听过|看过|知道|了解|认识|听说|听|看"
         r")[《]?([^《》，。？！\s]{2,16})[》]?吗?",
         r"听说[过]?[《]?([^《》，。？！\s]{2,16})[》]?",
-        r"[《]?([^《》，。？！\s]{2,16})[》]?讲[的是什]?[么么]",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?讲(?:的是什|的什|了什|什|的是|的|是|了)?[么吗嘛啥]",
         r"[《]?([^《》，。？！\s]{2,16})[》]?的(?:导演|演员|主角|剧情|简介|上映|评分)",
         r"[《]?([^《》，。？！\s]{2,16})[》]?好看吗",
         r"[《]?([^《》，。？！\s]{2,16})[》]?(?:怎么样|如何)",
@@ -543,6 +568,9 @@ def _extract_unknown_movie_name(m: str) -> str | None:
         for role in _TERMINATORS:
             if role in nm:
                 nm = nm.split(role)[0]
+        # 剥掉尾部的「指代 + 类别词」（如「奇幻大冒险那部动画片」→「奇幻大冒险」、
+        # 「这片子」→「」），只留真正的片名候选；再交给 get_movie_info_by_name 模糊匹配。
+        nm = re.sub(r"(?:这部|那部|这个|那个)?(?:动画片|动漫|电影|影片|片子|剧)$", "", nm).strip(_PARTICLES)
         # 过滤指代/疑问词（如「你知道这部电影叫什么吗」会误抓「这部电影叫什么」）
         if not nm or nm in _STOP or len(nm) < 2:
             continue
@@ -672,11 +700,15 @@ def _extract_unknown_genre_phrase(m: str) -> str | None:
     return None
 
 
-def _extract_params_rule(message: str) -> dict:
+def _extract_params_rule(message: str, sid: str | None = None) -> dict:
     """确定性参数抽取（不依赖 LLM）：覆盖绝大多数「找电影/推荐」句式，速度快、零幻觉、
     不依赖弱模型是否会抽 JSON。作为【电影意图主路径】的参数来源，替代不稳定的 LLM 抽取。
 
     返回字段与 _extract_params 完全一致，便于 _route_tool 直接消费。
+
+    sid：可选。显式传入会话 id 用于「续轮条件继承」；不传则回退读 _SESSION_ID_CTX。
+    必须显式传——流式路径下 FastAPI 把生成器丢进线程池逐 next() 执行，
+    contextvar 跨线程丢失，_SESSION_ID_CTX.get() 会退化回 'default'，导致会话记忆（再推荐继承）失效。
     """
     m = message
     default = {"mode": "find", "name": "", "genre": "", "year": 0,
@@ -731,7 +763,7 @@ def _extract_params_rule(message: str) -> dict:
     sorts = []
     if any(k in m for k in ["评分最高", "评分", "按评分", "最高分", "打分高", "分高"]):
         sorts.append("rating")
-    if any(k in m for k in ["热度最高", "热度", "最火", "按热度", "受欢迎", "看的人多"]):
+    if any(k in m for k in ["热度最高", "热度", "最火", "按热度", "受欢迎", "看的人多", "人气"]):
         sorts.append("popularity")
     if any(k in m for k in ["最新", "年份最高", "按年份", "近年", "近期", "新上映"]):
         sorts.append("year")
@@ -770,9 +802,16 @@ def _extract_params_rule(message: str) -> dict:
     # 8) 续轮「再推荐 / 换一个 / 还有别的」：若本轮【未明说】类型/地区/年份/排序，
     #    自动继承上一轮 find 的条件（会话级记忆），解决无状态路由在续轮丢失 genre 的问题
     #    （用户反复吐槽「再推荐脱离前文」）。本轮若显式给了新类型，则以本轮为准，不覆盖。
+    #    【语义轮继承】上一轮若是语义检索（mode=semantic），续轮未给任何新条件时继承语义 query，
+    #    保持「结局治愈 / 时间循环 / 深夜一个人」这类主题延续，而非退化回评分最高电影。
     if _is_followup(m):
-        last = _get_last_find(_SESSION_ID_CTX.get())
+        last = _get_last_find(sid or _SESSION_ID_CTX.get())
         if last:
+            if (last.get("mode") == "semantic" and not default["genre"]
+                    and not default["sort"] and not default["query"]):
+                default["mode"] = "semantic"
+                default["query"] = last.get("query") or m
+                return default
             if not default["genre"] and last.get("genre"):
                 default["genre"] = last["genre"]
             if not default["country"] and last.get("country"):
@@ -808,10 +847,11 @@ _SORT_LABEL = {
 }
 
 
-def _route_tool(params: dict, message: str, tr=None) -> str:
+def _route_tool(params: dict, message: str, tr=None, sid: str | None = None) -> str:
     """根据结构化参数，在代码里直接调用对应工具，返回工具的真实文本结果。
     message 用于注入 contextvar（供 find_movies 做类型词自动抽取兜底）。
     tr 显式传入用于埋点（记录工具调用链，修复流式异步下记丢的问题）。
+    sid 显式传入用于「会话级去重 / 续轮条件继承」（流式线程池下 contextvar 会丢，故显式传）。
 
     支持「多排序维度」：sort 以逗号分隔多个维度时，分别调用 find_movies 并分块返回，
     从而能正确满足「分别推一个评分最高和一个热度最高」这类诉求（两者往往是不同电影，
@@ -829,7 +869,11 @@ def _route_tool(params: dict, message: str, tr=None) -> str:
             tool = _tool_by_name("semantic_search_movies")
             if tr is not None:
                 tr.tool_calls.append({"name": "semantic_search_movies", "args": {"query": params.get("query") or message, "top_k": 5}})
-            return str(tool.invoke({"query": params.get("query") or message, "top_k": 5}))
+            result = str(tool.invoke({"query": params.get("query") or message, "top_k": 5}))
+            # 语义轮也记入会话记忆（mode=semantic + query），供续轮「再推荐/换一个」继承主题
+            _set_last_find(sid or _SESSION_ID_CTX.get(), "", "", 0, "",
+                           mode="semantic", query=params.get("query") or message)
+            return result
 
         # 片名片段搜索：用户只记得标题里的字（如「标题里有冒险王这三个字」）→ 走 search_movies 模糊匹配，
         # 而非退化成 genre 检索（「冒险王」含类型词「冒险」会被误判）。
@@ -857,7 +901,7 @@ def _route_tool(params: dict, message: str, tr=None) -> str:
 
         # 会话级「已推荐去重」：本会话之前推过的电影，这次优先排除，
         # 让「再推荐 / 换一个 / 随机」不再命中刚推过的同一部（用户明确吐槽过的点）。
-        sid = _SESSION_ID_CTX.get()
+        sid = sid or _SESSION_ID_CTX.get()
         exclude_ids = _recommended_exclude(sid)
 
         def _run_find_blocks(excl):
@@ -916,6 +960,10 @@ def _route_tool(params: dict, message: str, tr=None) -> str:
 
 # 把工具的「真实结果」用自然、会"听人话"的中文讲给用户（事实仍 100% 来自工具，零幻觉）
 _RESPOND_TEMPLATE = """你是智影影评网站的智能助手，正在和用户多轮聊电影。
+
+【直接进入正题 · 不要寒暄】
+- 用户直接问电影/要推荐时，**开头不要打招呼、不要自我介绍、不要寒暄**（如「你好呀～我是智影影评网站的智能助手…」这类）。
+- 即使上文（对话历史）里有过问候，也不要重复——直接回答当前问题即可。
 
 【铁律 · 只能基于工具结果说话】
 - 你只能依据下面【工具结果】里给出的信息来谈论电影。禁止编造任何电影名、评分、年份、类型、地区、简介。
@@ -980,8 +1028,40 @@ def _llm_reply_stream(system_text: str, history, question: str):
             yield c
 
 
+# —— 纯闲聊模板 ——
+# 用户来聊天/倾诉（不是找电影）时使用。此前直接用 movie 导向的 system_prompt() 给弱模型，
+# 它在 temp=0 下要么照搬「不客气～有需要随时找我」这类回应感谢的收尾、要么干脆罗列一屏电影，
+# 都不懂「陪我聊两句」= 聊天。故用专门的闲聊模板明确指令，让模型真正「接住话」。
+_CHAT_TEMPLATE = """你是智影影评网站的智能助手，现在用户是在【闲聊/倾诉/日常对话】，不是在找电影。
+系统已确认：用户刚才的话里没有任何电影、影评或推荐需求（有的话会自动走电影检索，不会走到你这里）。
+
+请用自然、有温度的中文回应：
+- 认真接住对方的话：对方说累/心情不好/想聊天，就先共情、顺着聊（关心一句、聊聊怎么放松都行），不要答非所问。
+- 结尾可以自然反问一句，把对话延续下去。
+- 【绝对禁止】推荐、罗列或介绍任何电影，不要提「资料库/数据库/检索」，不要聊影评。
+- 【绝对禁止】用「不客气」「有需要随时找我」「拜拜」「感谢你」这类【回应感谢/道别】的收尾语——
+  那是用户说「谢谢」时才用的；用户现在是想聊天，你要聊下去，而不是结束对话。
+- 保持简短自然（1~3 句）。
+
+【对话上文】
+{history}
+
+【用户刚说的话】
+{question}
+"""
+
+
 def _respond_chat(message: str, history) -> str:
-    return _llm_reply(system_prompt(), history, message)
+    prompt = (_CHAT_TEMPLATE.replace("{history}", _fmt_history(history))
+                            .replace("{question}", message))
+    return _llm_reply(prompt, [], message)
+
+
+def _respond_chat_stream(message: str, history):
+    """_respond_chat 的流式版：逐 token 产出闲聊回复。"""
+    prompt = (_CHAT_TEMPLATE.replace("{history}", _fmt_history(history))
+                            .replace("{question}", message))
+    yield from _llm_reply_stream(prompt, [], message)
 
 
 # 身份类问题：固定自介，确定性返回（不交给弱模型自由发挥，避免「请问你是」被当问候忽略）
@@ -1062,8 +1142,23 @@ def _sanitize_polish(answer: str, true_total: int) -> str:
     return re.sub(r"^[。，、\s]+", "", cleaned).strip()
 
 
+# 纯问候/自介的助手消息（如 _GREET_REPLY）在「电影答案润色」时不传给模型——
+# 否则润色模型看到上一条是问候，会把问候原样重复在新回答开头，
+# 导致「用户直接问电影」却先被寒暄一遍（用户实测：先「你好」再问推荐，开头又冒出
+# 「你好呀～我是智影影评网站的智能助手…」）。问候是纯客套、无电影信息，丢掉不影响上下文。
+_GREET_ONLY_RE = re.compile(r"^(?:你好|您好|哈喽|嗨)[^，。]{0,8}?我是.*(?:智能助手|电影助手).*$")
+
+
+def _strip_greeting_only(history):
+    """从对话历史里去掉「纯问候/自介」的助手消息（仅用于电影答案润色环节）。"""
+    if not history:
+        return history
+    return [m for m in history
+            if not (isinstance(m, AIMessage) and _GREET_ONLY_RE.match(str(m.content or "")))]
+
+
 def _respond_result(message: str, raw_result: str, history, true_total: int = 0) -> str:
-    prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(history))
+    prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(_strip_greeting_only(history)))
                                 .replace("{question}", message)
                                 .replace("{result}", raw_result))
     answer = _llm_reply(prompt, [], message)
@@ -1329,7 +1424,7 @@ _NOT_FOUND_KNOWLEDGE_TEMPLATE = """你是一个电影知识助手。用户问的
 def _not_found_knowledge_reply(name: str, message: str, history) -> str:
     """库外具体电影（非流式）：模型用公开知识作答，代码强制追加免责声明，返回完整字符串。"""
     prompt = (_NOT_FOUND_KNOWLEDGE_TEMPLATE.replace("{name}", name or "")
-              .replace("{history}", _fmt_history(history))
+              .replace("{history}", _fmt_history(_strip_greeting_only(history)))
               .replace("{question}", message))
     ans = "".join(_llm_reply_stream(prompt, [], message))
     return ans + "\n\n" + _NOT_FOUND_KNOWLEDGE_DISCLAIMER.format(name=name or "")
@@ -1338,16 +1433,17 @@ def _not_found_knowledge_reply(name: str, message: str, history) -> str:
 def _not_found_knowledge_reply_stream(name: str, message: str, history):
     """库外具体电影（流式）：逐 token 产出模型作答，结束时代码强制追加免责声明。"""
     prompt = (_NOT_FOUND_KNOWLEDGE_TEMPLATE.replace("{name}", name or "")
-              .replace("{history}", _fmt_history(history))
+              .replace("{history}", _fmt_history(_strip_greeting_only(history)))
               .replace("{question}", message))
     for t in _llm_reply_stream(prompt, [], message):
         yield t
     yield "\n\n" + _NOT_FOUND_KNOWLEDGE_DISCLAIMER.format(name=name or "")
 
 
-def _deterministic_movie_path(message: str, history, tr=None) -> str:
+def _deterministic_movie_path(message: str, history, tr=None, sid: str | None = None) -> str:
     """电影意图【主路径】：用我们已验证可靠的「代码抽参 + 代码调工具 + 自然语言」路径（仍零幻觉）。
     代码直接调工具（不再依赖弱模型会不会 function calling），100% 可靠、只多 1 次 LLM 润色。
+    sid 显式传入会话 id（流式线程池下 contextvar 会丢，必须显式传才能保住会话记忆）。
     """
     forced_title = _find_title_in_text(message)
     if forced_title:
@@ -1357,10 +1453,10 @@ def _deterministic_movie_path(message: str, history, tr=None) -> str:
             tr.tool_calls.append({"name": "get_movie_info_by_name", "args": {"name": forced_title}})
         raw = str(tool.invoke({"name": forced_title}))
     else:
-        params = _extract_params_rule(message)
+        params = _extract_params_rule(message, sid)
         if params.get("defer"):
             return _respond_defer(message, history)
-        raw = _route_tool(params, message, tr)
+        raw = _route_tool(params, message, tr, sid)
     if _is_not_found(raw):
         # 库外具体电影（用户点名、资料库未收录）→ 方案1：公开知识作答 + 代码强制免责声明
         nm = forced_title or (params.get("name") if (params and params.get("mode") == "movie_info") else None)
@@ -1370,13 +1466,14 @@ def _deterministic_movie_path(message: str, history, tr=None) -> str:
     return _respond_result(message, raw, history, _true_total_from_raw(raw))
 
 
-def _run_deterministic_stream(message: str, history, tr=None):
+def _run_deterministic_stream(message: str, history, tr=None, sid: str | None = None):
     """_deterministic_movie_path 的流式版：确定性工具调用（同步）照常执行，
     最终自然语言用 stream=True 逐 token 产出。是电影意图的【默认流式路径】。
 
     流程：规则抽参（0 次 LLM）→ 代码调工具（真实 DB 数据）→ 模板复述（1 次 LLM 润色）。
     相比自主 agent 循环（最坏 3 轮 × LLM + 兜底 2 次 LLM = 5 次调用），
     这里固定 1 次 LLM 调用，延迟从 ~50s 降到 ~10s，且答案 100% 基于工具真实数据。
+    sid 显式传入会话 id（流式线程池下 contextvar 会丢，必须显式传才能保住会话记忆）。
     """
     forced_title = _find_title_in_text(message)
     if forced_title:
@@ -1390,7 +1487,7 @@ def _run_deterministic_stream(message: str, history, tr=None):
             return
         yield from _respond_result_stream(message, raw, history)
         return
-    params = _extract_params_rule(message)
+    params = _extract_params_rule(message, sid)
     if params.get("defer"):
         # 用户说"稍后再给要求 / 先别急"——不查库，自然回应等他开口
         prompt = (_DEFER_TEMPLATE.replace("{history}", _fmt_history(history))
@@ -1398,7 +1495,7 @@ def _run_deterministic_stream(message: str, history, tr=None):
         for t in _llm_reply_stream(prompt, [], message):
             yield t
         return
-    raw = _route_tool(params, message, tr)
+    raw = _route_tool(params, message, tr, sid)
     if _is_not_found(raw):
         # 库外具体电影（用户点名、资料库未收录）→ 方案1：模型用公开知识作答 + 代码强制免责声明
         nm = params.get("name") if params.get("mode") == "movie_info" else None
@@ -1420,17 +1517,18 @@ def _respond_result_stream(message: str, raw_result: str, history):
     已含真实总数（第 588 行注入「共 M 部符合条件」），模型直接照说即可，无需事后缓冲清洗。
     非流式 _respond_result 仍保留 _sanitize_polish 硬兜底。
     """
-    prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(history))
+    prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(_strip_greeting_only(history)))
                                 .replace("{question}", message)
                                 .replace("{result}", raw_result))
     yield from _llm_reply_stream(prompt, [], message)
 
 
-def _deterministic_movie_path_stream(message: str, history, tr=None):
+def _deterministic_movie_path_stream(message: str, history, tr=None, sid: str | None = None):
     """_deterministic_movie_path 的流式版：确定性工具调用（同步）照常执行，
     但最终自然语言用 stream=True 逐 token 产出，避免兜底时「一次性全吐」。
 
     作为「主路径（_run_deterministic_stream）也空手而归」时的最后兜底（罕见，如工具全失败）。
+    sid 显式传入会话 id（流式线程池下 contextvar 会丢，必须显式传才能保住会话记忆）。
     """
     forced_title = _find_title_in_text(message)
     if forced_title:
@@ -1442,7 +1540,7 @@ def _deterministic_movie_path_stream(message: str, history, tr=None):
         params = _extract_params(message)
         if params.get("defer"):
             return  # defer 在流式主流程已有独立分支处理，不会走到这
-        raw = _route_tool(params, message, tr)
+        raw = _route_tool(params, message, tr, sid)
     if _is_not_found(raw):
         # 库外具体电影（用户点名、资料库未收录）→ 方案1：公开知识作答 + 代码强制免责声明
         nm = forced_title or (params.get("name") if (params and params.get("mode") == "movie_info") else None)
@@ -1516,7 +1614,7 @@ def _run_chat(message: str, session_id: str = "default") -> tuple[str, dict]:
                     answer = _deterministic_movie_path(message, history, tr)
             else:
                 tr.mode = "deterministic"
-                answer = _deterministic_movie_path(message, history, tr)
+                answer = _deterministic_movie_path(message, history, tr, session_id)
                 if not answer:
                     # 确定性路径空手而归（罕见，如工具全失败）→ 退回自主 agent 作最后尝试
                     answer = _agent_run_with_guardrail(message, history, tr) or ""
@@ -1568,12 +1666,12 @@ def _run_chat_stream(message: str, session_id: str = "default"):
         full = ""
 
         if intent == "chat":
-            # 纯问候确定性返回（不调 LLM，~0ms）；其余闲聊照常流式 LLM
+            # 纯问候确定性返回（不调 LLM，~0ms）；其余闲聊照常流式 LLM（用专门的闲聊模板）
             if _is_pure_greeting(message):
                 full = _GREET_REPLY
                 yield {"type": "token", "text": full}
             else:
-                for t in _llm_reply_stream(system_prompt(), history, message):
+                for t in _respond_chat_stream(message, history):
                     full += t
                     yield {"type": "token", "text": t}
         elif intent == "identity":
@@ -1605,7 +1703,7 @@ def _run_chat_stream(message: str, session_id: str = "default"):
                 # 规则路由模式（默认）：代码驱动确定性路由，仅 1 次 LLM 润色，可靠且快。
                 tr.mode = "deterministic"
                 yield {"type": "status", "text": "正在检索电影库…"}
-                for t in _run_deterministic_stream(message, history, tr):
+                for t in _run_deterministic_stream(message, history, tr, session_id):
                     full += t
                     yield {"type": "token", "text": t}
                 if not full:
@@ -1615,7 +1713,7 @@ def _run_chat_stream(message: str, session_id: str = "default"):
                         yield {"type": "token", "text": t}
                     if not full:
                         # 仍为空 → 再退回确定性兜底
-                        for t in _deterministic_movie_path_stream(message, history, tr):
+                        for t in _deterministic_movie_path_stream(message, history, tr, session_id):
                             full += t
                             yield {"type": "token", "text": t}
 

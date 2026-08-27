@@ -86,8 +86,7 @@ CREATE TABLE `reviewers` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='评论者';
 
 -- ------------------------------------------------------------
--- 3. 影评表 reviews（TMDb reviews；短评是豆瓣独有概念，本项目不含）
---    一条影评属于一部电影、一个作者
+-- 3. 影评表  （ 一条影评属于一部电影、一个作者）
 -- ------------------------------------------------------------
 CREATE TABLE `reviews` (
   `id`              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增主键',
