@@ -8,7 +8,9 @@
 """
 
 from contextvars import ContextVar
+from logging import getLogger
 from langchain_core.tools import tool
+from sqlalchemy import text
 
 from app import crud
 from app.db.database import SessionLocal
@@ -22,7 +24,7 @@ _USER_QUERY_CTX: ContextVar[str] = ContextVar("user_query", default="")
 GENRE_KEYWORDS = [
     "动作", "冒险", "动画", "喜剧", "犯罪", "纪录片", "剧情", "家庭",
     "奇幻", "历史", "恐怖", "音乐", "爱情", "科幻", "电视电影", "惊悚",
-    "战争", "西部",
+    "悬疑", "战争", "西部",
 ]
 # 含否定词时保守地不做自动类型抽取，避免把「不要动画」误判为要动画
 _NEGATION_WORDS = ["不要", "非", "别", "不是", "除了", "排除", "不想要", "不想看", "别推荐"]
@@ -38,6 +40,7 @@ _GENRE_SYNONYMS = {
     "打斗": "动作",
     "燃": "动作",
     "爽": "动作",
+    "动漫": "动画",
     "搞笑": "喜剧",
     "幽默": "喜剧",
     "搞怪": "喜剧",
@@ -47,12 +50,67 @@ _GENRE_SYNONYMS = {
     "治愈": "剧情",
     "励志": "剧情",
     "浪漫": "爱情",
+    "言情": "爱情",
     "甜": "爱情",
     "吓人": "恐怖",
+    "鬼片": "恐怖",
+    "警匪": "犯罪",
+    "推理": "悬疑",
     "惊悚向": "惊悚",
-    "悬疑": "惊悚",
     "烧脑": "科幻",
 }
+
+
+def _audit_genre_vocabulary() -> tuple:
+    """对照真实库自检 genre 词表是否自洽（根治「类型被错并/漏识别」类问题）：
+
+    - 每个库内真实 genre 标签都必须能被识别（在 GENRE_KEYWORDS 中，或作为同义词源）；
+      否则用户说「X」时查不到该标签——本次「悬疑」的坑即属此类（曾被错并到惊悚）。
+    - 每个同义词目标都必须是库内真实存在的 genre，否则会把查询发到不存在的标签 → 返回未找到。
+
+    返回 (ok, report)。DB 不可达时返回 (True, 跳过说明)，绝不抛异常，保证导入安全。
+    """
+    try:
+        db = SessionLocal()
+        rows = db.execute(text("SELECT DISTINCT genres FROM movies")).fetchall()
+        db_genres: set = set()
+        for (g,) in rows:
+            for tok in str(g).replace("，", ",").split(","):
+                tok = tok.strip()
+                if tok:
+                    db_genres.add(tok)
+    except Exception:
+        return True, "DB 不可达，跳过 genre 词表自检"
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    problems: list = []
+    for g in sorted(db_genres):
+        if g not in GENRE_KEYWORDS and g not in _GENRE_SYNONYMS:
+            problems.append(
+                f"库内标签『{g}』既不在 GENRE_KEYWORDS 也不在同义词源，"
+                f"用户说『{g}』时将无法被识别为该类型"
+            )
+    for syn, real in _GENRE_SYNONYMS.items():
+        if real not in db_genres:
+            problems.append(
+                f"同义词『{syn}』→『{real}』，但『{real}』不是库内真实标签，查询会落空"
+            )
+    if problems:
+        return False, "genre 词表自检发现问题:\n" + "\n".join(problems)
+    return True, (
+        f"OK: 库内 {len(db_genres)} 个 genre 标签全部可被识别，"
+        f"且 {len(_GENRE_SYNONYMS)} 条同义词目标均在库内真实存在"
+    )
+
+
+# 启动自检：导入即核对词表与库一致；不一致只告警、不影响启动（导入安全）。
+_logger = getLogger(__name__)
+_genre_ok, _genre_report = _audit_genre_vocabulary()
+if not _genre_ok:
+    _logger.warning(_genre_report)
 
 
 def _normalize_genre_token(token: str) -> str | None:
@@ -128,13 +186,14 @@ def search_movies(keyword: str) -> str:
 
 @tool
 def find_movies(genre: str = "", year: int = 0, country: str = "",
-                sort: str = "rating", limit: int = 5) -> str:
+                sort: str = "rating", limit: int = 5, exclude_ids: list = None) -> str:
     """按任意条件组合筛选并排序电影，是「找电影/推荐电影」的统一入口。所有参数均可选、可任意组合，模型应根据用户的话挑出相关参数填入：
     - genre: 类型名（中文，如 科幻、喜剧、动作、动画、剧情、恐怖、爱情）。**注意：类型这一项已由系统在拿到用户原话后自动抽取并合并过滤（代码级、确定性），你即使只传其中一个类型，系统也会把用户话里提到的其它类型一并加上、取交集。所以你只管正常传参即可，不必为「多个类型」反复纠结。**
     - year: 上映年份（数字，如 2021）
     - country: 国家/地区（中文，如 美国、日本、韩国、中国），内部会自动映射到库内英文存储
-    - sort: 排序方式——rating(按评分降序,默认) / popularity(按热度降序) / year(按年份降序) / release(按上映日期降序)
+    - sort: 排序方式——rating(按评分降序,默认) / popularity(按热度降序) / year(按年份降序) / release(按上映日期降序) / random(随机，用于「随机/随便推荐一部」)
     - limit: 返回条数（默认5，最多20）
+    - exclude_ids: 排除指定电影 id 列表（系统内部用于「会话级去重」，让「再推荐/换一个/随机」不再命中刚推荐过的同一部）。模型一般无需手动传；若你确实想避免重复某几部，可传其 id。
     适用示例：「评分最高的动作片」→ genre=动作, sort=rating；「2021年上映的中国电影」→ year=2021, country=中国；「按热度排的科幻片」→ genre=科幻, sort=popularity；「评分最高且是2024年的」→ year=2024, sort=rating；「爱情的动画」→ 系统会自动锁定 动画 AND 爱情。**绝不要自行脑补用户没说的类型维度（年份/地区）；用户没提就留空。**"""
     db = SessionLocal()
     try:
@@ -147,6 +206,7 @@ def find_movies(genre: str = "", year: int = 0, country: str = "",
             country=country or None,
             sort=sort or "rating",
             limit=min(limit or 5, 20),
+            exclude_ids=exclude_ids,
         )
         if not rows:
             cond = "、".join(
@@ -158,7 +218,8 @@ def find_movies(genre: str = "", year: int = 0, country: str = "",
         # 真实总条数（不受 limit 截断影响），供「诚实告知缺量」使用——
         # 例如库里实际有 20 部动画、用户只要 2 部时，这里报 20 而非被截断后的 2。
         total = crud.count_movies(
-            db, genre=genre_merged, year=year or None, country=country or None
+            db, genre=genre_merged, year=year or None, country=country or None,
+            exclude_ids=exclude_ids,
         )
         lines = [f"找到 {len(rows)} 部电影（按{sort}排序，共 {total} 部符合条件）："]
         for m in rows:

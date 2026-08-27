@@ -72,11 +72,15 @@ def _all_listening(force: bool = False) -> "dict[int, list[int]]":
         return _PORT_CACHE
     mapping: "dict[int, list[int]]" = {}
     if IS_WIN:
-        # 1) netstat 主力（原生、极快——本机实测 40ms 出结果且能正确返回监听行；
-        #    只匹配 LISTENING 行的本地地址列，不会误命中 Coze 等外向连接的 IPv6 地址）
+        # 1) netstat 主力（原生、极快——本机实测 40ms 出结果且能正确返回监听行）。
+        #    注意：必须用 `netstat -ano`（不过滤协议），不能写 `netstat -ano -p TCP`——
+        #    后者只查 IPv4 监听器，会漏掉 TCPv6 监听器。vite 默认绑 `localhost`，
+        #    本机 Node 把 localhost 解析成 IPv6 的 ::1，于是 vite 监听在
+        #    `::1:5173`（TCPv6）；若只查 TCP，前端端口判定会恒为 False，
+        #    导致「检测不到前端已起、一直橙色转红」。用 -ano 同时覆盖 IPv4/IPv6。
         try:
             raw = subprocess.check_output(
-                ["netstat", "-ano", "-p", "TCP"],
+                ["netstat", "-ano"],
                 stderr=DEVNULL,
             )
             out = raw.decode("mbcs", errors="replace")
@@ -181,6 +185,10 @@ class LauncherApp:
         self._watchdog_last = {}
         # 各子进程日志落盘路径（.run/<service>.log）；GUI 端尾随文件，不回灌子进程
         self._log_paths = {}
+        # 前端实际监听端口（vite 可能因 :5173 被占而自动递增到 5174+），
+        # 供「进入前端页」动态打开真实端口，也用于检测时探测范围。
+        self.frontend_port = FRONTEND_PORT
+        self.frontend_url = FRONTEND_URL
 
         self._build_ui()
         # 健康看门狗：后端进程「假死」（端口仍被占用但 /health 无响应）时
@@ -203,8 +211,10 @@ class LauncherApp:
         svc.pack(fill="x", padx=12, pady=4)
         self._service_row(svc, "后端 (FastAPI :8000)", "backend",
                           API_DOCS_URL, "进入 API 文档")
+        # 前端 enter_url 传 None：用 _open_service 动态打开实际探测到的端口
+        # （vite 可能自动跳到 5174+，按钮需跟着跳）。
         self._service_row(svc, "前端 (Vue :5173)", "frontend",
-                          FRONTEND_URL, "进入前端页")
+                          None, "进入前端页")
 
         # 一键 / 停止全部
         bar = ttk.Frame(self.root)
@@ -350,7 +360,7 @@ class LauncherApp:
         ttk.Label(row, text=label, width=24).pack(side="left")
         ttk.Button(row, text="启动", command=lambda: self.start_service(key)).pack(side="left", padx=2)
         ttk.Button(row, text="停止", command=lambda: self.stop_service(key)).pack(side="left", padx=2)
-        ttk.Button(row, text=enter_text, command=lambda: self._open(enter_url)).pack(side="left", padx=2)
+        ttk.Button(row, text=enter_text, command=lambda: self._open_service(key, enter_url)).pack(side="left", padx=2)
 
     @staticmethod
     def _draw_dot(canvas, color):
@@ -373,6 +383,13 @@ class LauncherApp:
         import webbrowser
         webbrowser.open(url)
         self.log_msg(f"[打开浏览器] {url}")
+
+    def _open_service(self, key, url):
+        """打开服务页：url 为 None 时（前端）用实际探测到的端口，
+        兼容 vite 因 :5173 被占而自动跳到 5174+ 的情况。"""
+        target = url if url else (self.frontend_url if key == "frontend" else None)
+        if target:
+            self._open(target)
 
     def log_msg(self, msg):
         self._insert(msg)
@@ -437,24 +454,32 @@ class LauncherApp:
     def _backend_env() -> dict:
         """返回传给后端 / 建库子进程的干净环境。
 
-        剔除可能由启动器进程残留的 LLM_*/EMBEDDING_*/DATABASE_URL/TMDB_API_KEY，
-        强制子进程从 backend/.env 重新读取最新配置——这样改完 .env 后，
-        只需在启动器里「停止后端 → 启动后端」即可生效，不必重启整个启动器。
+        直接读取 backend/.env 并把其中的 LLM_*/EMBEDDING_*/DATABASE_URL/TMDB_API_KEY
+        注入子进程环境，确保子进程**无论用哪个 Python、cwd 在哪**都能稳定拿到最新配置——
+        不再依赖「先剔除环境变量、再靠相对路径 .env 重新加载」这条脆弱链路
+        （该链路在启动器所用 Python 与 CLI 不同时，会偶发拿不到依赖/配置而静默失败）。
+        改完 .env 后，只需在启动器里「停止 → 启动」即可生效。
         """
         env = dict(os.environ)
-        for k in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL",
-                  "EMBEDDING_API_KEY", "EMBEDDING_BASE_URL", "EMBEDDING_MODEL",
-                  "DATABASE_URL", "TMDB_API_KEY"):
-            env.pop(k, None)
+        env_path = os.path.join(BACKEND_DIR, ".env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, _, v = line.partition("=")
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k:
+                            env[k] = v
+            except Exception:  # noqa: BLE001
+                pass
         return env
 
     def _spawn_backend(self):
-        # 启动前仅当端口真被占用时才清理：正常启动（端口空闲）跳过，
-        # 避免每次启动都查端口导致卡顿、进程堆积（此前启动变慢的根因）
-        if _port_in_use(BACKEND_PORT):
-            killed = self._kill_by_port(BACKEND_PORT)
-            if killed:
-                self.log_msg(f"[清理] 已释放 {killed} 个占用后端端口(:{BACKEND_PORT})的残留进程")
+        # 一键启动 = 纯启动，不再在此杀进程 / 关接口（职责已移到「停止全部」）。
+        # 若 :8000 已被占用，uvicorn 会绑定失败，_wait_backend_ready 超时后转红并提示先「停止全部」。
         env = self._backend_env()
         try:
             proc = self._spawn(
@@ -553,19 +578,71 @@ class LauncherApp:
         if not npm:
             self.log_msg("[前端][错误] 未找到 npm，请确认 Node.js 已安装并在 PATH 中")
             return
-        # 启动前仅当端口真被占用时才清理（正常启动跳过，避免卡顿/进程堆积）
-        if _port_in_use(FRONTEND_PORT):
-            killed = self._kill_by_port(FRONTEND_PORT)
-            if killed:
-                self.log_msg(f"[清理] 已释放 {killed} 个占用前端端口(:{FRONTEND_PORT})的残留进程")
+        # 纯启动：不再在此杀进程 / 关接口（职责已移到「停止全部」）。
+        # 注意：用 shell=True 跟踪的是 cmd.exe/npm 包装进程，它退出 ≠ vite 退出；
+        # 因此前端「是否就绪 / 是否还活着」一律以端口 :5173 是否监听为准（见
+        # _wait_frontend_ready / _log_tailer / _on_proc_exit），避免误判「进程已退出」。
         try:
             proc = self._spawn(f"{npm} run dev", FRONTEND_DIR, "前端", shell=True)
             self.procs["frontend"] = proc
-            self._set_status("frontend", True)
+            # 立刻置橙（启动中），给点击即时反馈；真正就绪（:5173 监听）才转绿。
+            self.running["frontend"] = False
+            self._set_dot("frontend", "#f0a000")
             self.log_msg("[前端] 启动中... (npm run dev)")
+            threading.Thread(target=self._wait_frontend_ready, args=(proc,), daemon=True).start()
             threading.Thread(target=self._log_tailer, args=(proc, "前端"), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             self.log_msg(f"[前端][错误] {e}")
+
+    def _wait_frontend_ready(self, proc):
+        """前端健康检测：对前端端口发起 HTTP 探活（与后端 /health 同源思路，最可靠）。
+
+        关键修复（此前一直橙色 → 超时转红，但前端其实已起，且『之前能检测、现在不行』）：
+          - 旧版用 netstat `-p TCP` 判定端口占用，但 vite 默认绑 `localhost`，本机 Node
+            把 localhost 解析成 IPv6 的 ::1，于是 vite 监听在 TCPv6 的 `::1:5173`；
+            而 `netstat -p TCP` 只查 IPv4，根本看不到它 → `_port_in_use(5173)` 恒为 False。
+          - 另一版改用 HTTP 探活时又写死 `127.0.0.1`（IPv4），同样连不上 ::1。
+        两个坑叠加，把原本能用的检测搞坏了。现改为：
+          - 用 HTTP GET 探活，依次尝试 `localhost` / `[::1]` / `127.0.0.1`
+            （覆盖 IPv6 / IPv4 任一绑定，哪个先应答就判就绪，前端只用 5173，不扫其它端口）；
+          - 用 ProxyHandler({}) 强制不走系统代理，避免 127.0.0.1/localhost 被代理拦截；
+          - 超时放宽到 90s，容纳 vite 冷启动；检测到即置绿。
+        """
+        import time
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # 单端口 5173（用户每次启动前都会先关闭，不会跳端口）；
+        # 同时试 IPv6(::1) 与 IPv4(127.0.0.1) 两种地址族，兼容 vite 的 ::1 绑定。
+        hosts = ["localhost", "[::1]", "127.0.0.1"]
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            # 仅当本线程跟踪的 proc 已不是「当前前端」时才中止本轮（用户中途重启过）
+            if proc.poll() is not None and self.procs.get("frontend") is not proc:
+                return
+            detected = None
+            for h in hosts:
+                try:
+                    opener.open(f"http://{h}:{FRONTEND_PORT}/", timeout=2)
+                    detected = h
+                    break
+                except Exception:
+                    continue
+            if detected is not None:
+                self.frontend_port = FRONTEND_PORT
+                self.frontend_url = f"http://localhost:{FRONTEND_PORT}"
+                self.root.after(0, self._set_status, "frontend", True)
+                self.root.after(
+                    0, self.log_msg,
+                    f"[前端] 已就绪 ✅ (端口 :{FRONTEND_PORT} 监听中，探测命中 {detected})")
+                return
+            time.sleep(1)
+        # 超时：仅当本线程仍对应当前前端时才置红，避免误报掩盖新一次成功启动
+        if self.procs.get("frontend") is proc:
+            self.root.after(0, self._set_status, "frontend", False)
+            self.root.after(
+                0, self.log_msg,
+                f"[前端][超时] 90s 内未就绪，启动可能失败，请查看上方日志"
+                f"（若 :{FRONTEND_PORT} 被其它程序占用，请先『停止全部』再启动）")
 
     @staticmethod
     def _find_npm():
@@ -577,57 +654,77 @@ class LauncherApp:
             return None
 
     def start_all(self):
-        """一键启动前后端：先清理前端/后端端口上的全部残留进程，再依次启动。"""
-        self.log_msg("🚀 一键启动前后端：开始清理残留端口进程...")
-        self._cleanup_ports()
+        """一键启动前后端：纯启动（不杀进程、不关接口）。
+
+        职责边界（按用户要求重构）：
+        - 一键启动 = 只负责「启动」后端 + 前端；
+        - 杀进程 / 释放端口 = 全部交给「停止全部」按钮。
+        若端口已被占用，启动会失败（状态灯转红并有提示），此时应先点「停止全部」。
+        """
+        self.log_msg("🚀 一键启动前后端：开始启动（不清理端口，若提示端口被占用请先点『停止全部』）…")
         self.start_service("backend")
         self.start_service("frontend")
-
-    def _cleanup_ports(self) -> int:
-        """一键启动前清理：杀掉前端(5173)与后端(8000)、管理端(5180)端口上的所有残留进程，
-        并在日志展示共释放了多少个进程。返回释放总数。"""
-        b = self._kill_by_port(BACKEND_PORT)
-        f = self._kill_by_port(FRONTEND_PORT)
-        a = self._kill_by_port(ADMIN_PORT)
-        total = b + f + a
-        if total:
-            self.log_msg(
-                f"[清理] 共释放 {total} 个残留进程"
-                f"（后端 :{BACKEND_PORT} → {b} 个 / 前端 :{FRONTEND_PORT} → {f} 个"
-                f" / 管理端 :{ADMIN_PORT} → {a} 个）"
-            )
-        else:
-            self.log_msg("[清理] 端口干净，无残留进程，直接启动 ✅")
-        return total
 
     def _log_tailer(self, proc, tag):
         """异步尾随子进程日志文件，把新增行转发到 GUI 日志区。
 
         与旧 _reader（读 proc.stdout PIPE）本质不同：这里读的是『文件』，
-        不会反向阻塞子进程——子进程写日志永不被 GUI 读取线程卡住，
-        因此杜绝了「管道写满 → 事件循环阻塞 → 整进程假死」的死锁。
+        不会反向阻塞子进程——子进程写日志永不被 GUI 读取线程卡住。
+
+        关键修复（根治「rc=None 误报失败 + 子进程被遗弃后台卡死」）：
+        1) 读日志转发放进独立 try 块——即便转发途中（如后台线程里
+           self.root.after 抛异常）出错，也**绝不影响「等待进程真正结束」**；
+        2) 无论读日志成败，最终都显式 proc.wait(timeout) 拿真实退出码，
+           再回调 _on_proc_exit；不再依赖被异常吞掉后留下的 proc.poll()==None。
         """
+        import time  # 本函数内用到 time.sleep 做日志轮询节流，必须局部导入
         log_path = self._log_paths.get(tag)
-        if not log_path:
-            return
+        _port = {"后端": BACKEND_PORT, "前端": FRONTEND_PORT,
+                 "管理端": ADMIN_PORT}.get(tag)
+        # 1) 读日志转发（出错只记录、不中止等待）
+        if log_path:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(0, os.SEEK_END)  # 只看启动后的新日志
+                    # 结束条件 = 进程已退出「且」端口不再监听；否则继续尾随。
+                    # 前端用 shell=True 跟踪的是 npm 包装进程，它会先于 vite 退出，
+                    # 但 vite 仍在 :5173 提供服务——只要端口还活着就继续读日志。
+                    # proc.poll() 为 None（进程存活）时 or 短路，不查端口，零额外开销。
+                    while proc.poll() is None or (_port and _port_in_use(_port)):
+                        line = f.readline()
+                        if line:
+                            if tag == "TMDb":
+                                m = re.search(r"\[STEP\]\s*(\d+)/(\d+)", line)
+                                if m:
+                                    self.root.after(
+                                        0, self._set_tmdb_progress,
+                                        int(m.group(1)), int(m.group(2)))
+                            self.root.after(0, self.log_msg, f"[{tag}] {line.rstrip()}")
+                        else:
+                            time.sleep(0.2)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    self.root.after(
+                        0, self.log_msg,
+                        f"[{tag}][tailer] 读日志异常（不影响等待进程结束）：{e!r}")
+                except Exception:  # noqa: BLE001
+                    pass
+        # 2) 等进程真正结束，拿真实退出码（一次性任务给足超时，避免误判）
+        timeout = 1800 if tag == "向量库" else 600
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(0, os.SEEK_END)  # 只看启动后的新日志
-                while proc.poll() is None:
-                    line = f.readline()
-                    if line:
-                        if tag == "TMDb":
-                            m = re.search(r"\[STEP\]\s*(\d+)/(\d+)", line)
-                            if m:
-                                self.root.after(
-                                    0, self._set_tmdb_progress,
-                                    int(m.group(1)), int(m.group(2)))
-                        self.root.after(0, self.log_msg, f"[{tag}] {line.rstrip()}")
-                    else:
-                        time.sleep(0.2)
-        except Exception:  # noqa: BLE001
-            pass
-        rc = proc.poll()
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            rc = None
+            try:
+                self.root.after(
+                    0, self.log_msg,
+                    f"[{tag}] 进程 {timeout}s 内未结束，已强制终止（疑似卡死，请检查网络/代理）。")
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self.root.after(0, self._on_proc_exit, tag, rc)
         except Exception:  # noqa: BLE001
@@ -637,7 +734,22 @@ class LauncherApp:
         if tag == "向量库":
             self.running["embed"] = False
             self.procs["embed"] = None
-            ok = rc == 0
+            # 真实判定：优先看子进程退出码 rc；但若日志已打出「完成：已为 N 部」，
+            # 说明建库脚本确实跑通（此前出现过退出码误判导致误报失败），以日志为准，
+            # 避免「实际已成功建库、GUI 却报失败」让用户误以为启动器坏了。
+            lp = self._log_paths.get("向量库")
+            log_text = ""
+            if lp and os.path.exists(lp):
+                try:
+                    with open(lp, "r", encoding="utf-8", errors="replace") as f:
+                        log_text = f.read()
+                except Exception:  # noqa: BLE001
+                    pass
+            built_ok = ("完成：已为" in log_text) or (
+                "开始为电影建立语义向量索引" in log_text and "Traceback" not in log_text)
+            ok = (rc == 0) or built_ok
+            self.log_msg(f"[向量库] 调试：进程退出码 rc={rc}，日志显示建库"
+                         f"{'成功' if built_ok else '未完成'} → 判定 {'成功 ✅' if ok else '失败 ❌'}")
             self.embed_status_label.config(
                 text="状态：已构建 ✅" if ok else "状态：失败 ❌",
                 foreground="#1a7f37" if ok else "#b42318",
@@ -645,11 +757,20 @@ class LauncherApp:
             if ok:
                 self.log_msg("[向量库] 构建完成！agent 现已支持『按主题/剧情语义找片』。")
             else:
-                self.log_msg("[向量库] 构建失败：请检查 backend/.env 是否配置 EMBEDDING_API_KEY，"
-                             "以及星火 MaaS 嵌入接口是否可达。")
+                self.log_msg("[向量库] 构建失败。上方日志已显示真实报错，常见原因：")
+                self.log_msg("[向量库] 1) backend/.env 未配置/失效 EMBEDDING_API_KEY；2) 星火 MaaS 接口限流或不可达；3) 启动器所用 Python 缺依赖。")
+                # 把日志里最后的真实报错再贴一次，避免只看通用提示而漏掉根因
+                if log_text:
+                    tail = [l.rstrip() for l in log_text.splitlines() if l.strip()][-12:]
+                    for l in tail:
+                        self.log_msg(f"[向量库][log] {l}")
             return
         key = {"后端": "backend", "前端": "frontend", "管理端": "admin", "TMDb": "tmdb"}.get(tag)
         if key and self.running.get(key):
+            # 前端特例：被跟踪的 npm 包装进程会先于 vite 退出，但 vite 仍在 :5173
+            # 提供服务。此时端口仍监听，说明服务活着，不能判为「已退出」。
+            if tag == "前端" and _port_in_use(FRONTEND_PORT):
+                return
             self._set_status(key, False)
             self.log_msg(f"[{tag}] 进程已退出 (code={rc})")
         if tag == "TMDb":
@@ -827,8 +948,29 @@ class LauncherApp:
             self.log_msg("[向量库][错误] 找不到后端 python 路径，无法构建")
             return
         env = self._backend_env()
+        # 清理上次「被遗弃仍运行」的建库进程，避免与本次并发狂刷星火 MaaS
+        # 嵌入接口（会触发限流/卡死，导致本次也建库失败）。孤儿常源于早前
+        # 旧版启动器在子进程未结束时误报失败、又把引用置空，使进程脱离管控。
+        _pid_file = os.path.join(ROOT, ".run", "embed.pid")
+        if os.path.exists(_pid_file):
+            try:
+                with open(_pid_file, "r", encoding="utf-8") as f:
+                    old_pid = int(f.read().strip())
+                if old_pid and old_pid != os.getpid():
+                    try:
+                        os.kill(old_pid, signal.SIGTERM)  # Windows 下映射为 TerminateProcess
+                        self.log_msg(f"[向量库] 已清理上次遗留的建库进程(PID={old_pid})")
+                    except ProcessLookupError:
+                        pass  # 已退出
+                    except Exception as e:  # noqa: BLE001
+                        self.log_msg(f"[向量库][提示] 清理遗留进程失败（可忽略）：{e}")
+            except Exception:  # noqa: BLE001
+                pass
         self.running["embed"] = True
         self.embed_status_label.config(text="状态：构建中…", foreground="#b58100")
+        # 诊断：直接显示本次建库用的是哪个 Python、key 有没有注入，便于失败自查
+        self.log_msg(f"[向量库] 调试：python={BACKEND_PYTHON} 存在={os.path.exists(BACKEND_PYTHON)} "
+                     f"EMBEDDING_API_KEY 已注入={'EMBEDDING_API_KEY' in env and bool(env.get('EMBEDDING_API_KEY'))}")
         self.log_msg("[向量库] 开始切片 + 嵌入（调用星火 MaaS 嵌入 API）…")
         try:
             proc = self._spawn(

@@ -48,10 +48,11 @@ SYSTEM_PROMPT = """你是智影影评网站的智能助手。
 - 顺序铁律：先调用工具，再回答；未调用工具就不得给出任何电影片名或事实。
 - get_movie_info_by_name 已一次性返回完整资料（导演/演员/简介等），拿到后直接组织答案，**不要为同一部电影再重复调用 get_movie_detail**。
 
-【资料库没有这部电影时 · 要直接、别绕圈子】
-- 当 get_movie_info_by_name / search_movies 返回「未找到」时，说明资料库里暂时没有这部电影（可能还没收录）。请**直接、明确**地告诉用户，例如：「资料库里暂时还没有《XXX》这部电影（可能还没收录）。」然后可以友好地问一句「你想看什么类型的？我帮你推荐类似的」。
-- **绝不要反过来追问这部电影本身的年份 / 导演 / 主演 / 类型等细节**——你本来也不知道，追问只会绕圈子，让用户觉得答非所问。
-- 资料库返回未找到后，**不要**再去调用 semantic_search_movies 试图「确认」它是否存在（语义检索是按主题/感受找电影，不是用来查某部具体片是否在库的）。直接说未收录即可。
+【资料库没有这部电影时 · 诚实 + 可补充公开知识】
+- 当 get_movie_info_by_name(具体片名) 返回「未找到」时，说明资料库里暂时没有这部电影（可能还没收录）。
+- **针对用户点名问的「某部具体电影」**：你【可以】基于公开知识简要介绍这部电影（导演、年份、类型、剧情、口碑）来帮助用户；但**必须明确声明**「资料库暂未收录该片，以下内容基于公开知识、仅供参考」，绝不可假称资料库里有这些数据，也绝不可编造不确定的具体评分/票房数字。
+- **针对「按条件筛选」类**（如「悬疑片有哪些」）返回「未找到符合条件」：直接如实告诉用户资料库暂无此类电影即可，不要凭记忆编造片单。
+- 无论哪种情况，**绝不要反过来追问这部电影本身的年份/导演/主演等细节**（你本来也不知道），也**不要**再去调用 semantic_search_movies 试图「确认」它是否存在。
 
 【找电影 / 推荐电影】
 - 用户提到具体片名想看详情 → 用 get_movie_info_by_name(片名)。
@@ -84,10 +85,12 @@ SYSTEM_PROMPT = """你是智影影评网站的智能助手。
 _THANKS_KW = ["谢谢", "感谢", "多谢", "好的", "好嘞", "赞", "辛苦", "拜拜", "不错", "ok", "OK"]
 _GREET_KW = ["你好", "您好", "在吗", "hi", "hello", "嗨", "哈喽", "在不在"]
 _NAME_KW = ["知道", "了解", "认识", "叫", "这部", "那部", "《", "》", "关于", "讲的是",
-            "导演", "主演", "剧情", "简介", "上映", "哪年", "谁演", "看的"]
+            "导演", "主演", "剧情", "简介", "上映", "哪年", "谁演",
+            "听过", "看过", "听说过", "听说"]
 _RECOMMEND_KW = ["推荐", "找一些", "找几部", "有哪些", "有没有", "想看", "类似",
                  "什么类型", "题材", "排行", "评分最高", "热度最高", "帮我找",
-                 "给我找", "来一部", "来几部", "按", "有啥", "有什么"]
+                 "给我找", "来一部", "来几部", "按", "有啥", "有什么",
+                 "帮我挑", "帮我选", "挑选", "挑一部", "选一部", "挑几部", "选几部"]
 # 身份类问题：弱模型（glm-4-flash 免费档）对「你是谁/请问你是」时而答对时而把问题当问候忽略，
 # 故用确定性代码直接返回固定自我介绍，不交给模型自由发挥（与 defer 同理，绕开弱模型不稳定性）。
 # 注意：不能放裸「你的名字」——它是著名电影《你的名字》的片名，会撞车；问助手名字用「你的名字是什么」。
@@ -115,20 +118,28 @@ def _is_defer(message: str) -> bool:
 
 def _classify_intent(message: str) -> str:
     """返回 'chat' / 'identity' / 'movie_name' / 'recommend' / 'movie_related'。
-    顺序：chat → identity(带电影信号抑制) → name → recommend → movie_related。
-    - identity 放在 name 之前：避免「你叫什么名字」里的"叫"被 _NAME_KW 误判成查片名；
+    顺序（关键）：identity → name → recommend → 纯问候/感谢 → 兜底 movie_related。
+
+    【致命坑 · 已修】纯问候/感谢检查必须放在【最后】！原先它排在最前会短路返回 chat，
+    导致「你好啊，推荐一部爱情片」「谢谢，帮我找部动作片」这类带问候前缀的推荐诉求
+    被误判成闲聊，退化成纯 LLM 记忆作答（凭训练记忆编造库里没有的电影，如《重庆森林》）。
+    只有排除了所有电影/身份信号后，才安全当作闲聊。
+    - identity 仍放 name 之前：避免「你叫什么名字」里的"叫"被 _NAME_KW 误判成查片名；
       同时用 _MOVIE_SIGNAL_KW 抑制，保证「你知道《你是谁》吗」仍走查库而非身份闲聊。
     """
     m = message.lower()
-    if any(k in m for k in _THANKS_KW) or any(k in m for k in _GREET_KW):
-        return "chat"
-    # 身份问题：命中身份词、且不含任何电影信号词时，才判为「问助手自己」
+    # 1) 身份问题（含身份词且不含电影信号）—— 放最前，避免「叫」被当查片名
     if any(k in m for k in _IDENTITY_KW) and not any(k in m for k in _MOVIE_SIGNAL_KW):
         return "identity"
+    # 2) 具体电影名（你知道X吗 / 讲X的导演）→ 查库
     if any(k in m for k in _NAME_KW):
         return "movie_name"
+    # 3) 推荐/找片诉求（含「推荐/想看/找/有什么」等）→ 走工具路由，务必先查库
     if any(k in m for k in _RECOMMEND_KW):
         return "recommend"
+    # 4) 上面都不是 → 才当作纯问候/感谢/闲聊（此时已排除所有电影/身份信号，安全）
+    if any(k in m for k in _THANKS_KW) or any(k in m for k in _GREET_KW):
+        return "chat"
     return "movie_related"
 
 
@@ -203,6 +214,11 @@ class DBChatMessageHistory(BaseChatMessageHistory):
 # 对话结束统一落库到 agent_traces 表。管理端的「日志 / 缓存命中 / 护栏使用率」都读这张表。
 _TRACE_CTX: ContextVar = ContextVar("agent_trace", default=None)
 
+# 当前会话 id（供「会话级已推荐去重」使用）：在 _run_chat / _run_chat_stream 入口注入，
+# _route_tool 读它来记住「本会话已经给用户推荐过哪些电影」，从而避免「再推荐/换一个/随机」
+# 反复命中同一部。用 contextvar 而非改一堆中间函数签名，零侵入。
+_SESSION_ID_CTX: ContextVar = ContextVar("session_id", default="default")
+
 
 def _safe_reset(token):
     """安全重置 ContextVar；吞掉跨上下文（如测试客户端 worker 线程、某些 ASGI 服务器
@@ -215,6 +231,89 @@ def _safe_reset(token):
         pass
 
 
+# ---------------------- 会话级「已推荐去重」 ----------------------
+# 用户明确吐槽过：随机推荐十次都推同一部、再推荐也还是同一部——本质是「没有任何记忆、
+# 每次都从全池裸查」。这里用「会话维度 + 已推荐电影 id 集合」做去重：
+#   · 查库前排除本会话已推荐过的 id；
+#   · 查库后把本次结果里的 id 记进集合；
+#   · 集合仅在「排除后查无结果（池被耗尽）」时清空一次，避免无限膨胀也无片可推。
+_SESSION_RECOMMENDED: dict[str, set] = {}
+_SESSION_RECOMMENDED_LOCK = threading.Lock()
+
+
+def _recommended_exclude(sid: str) -> set:
+    """返回本会话应排除的电影 id 集合（查库前调用）。匿名会话（default）不做去重。"""
+    if not sid or sid == "default":
+        return set()
+    with _SESSION_RECOMMENDED_LOCK:
+        return _SESSION_RECOMMENDED.get(sid, set()).copy()
+
+
+def _record_recommended(sid: str, combined_text: str) -> None:
+    """把本次推荐结果里出现的电影 id 记进本会话集合（查库后调用）。"""
+    if not sid or sid == "default":
+        return
+    ids = set(int(x) for x in re.findall(r"id=(\d+)", combined_text or ""))
+    if not ids:
+        return
+    with _SESSION_RECOMMENDED_LOCK:
+        bucket = _SESSION_RECOMMENDED.setdefault(sid, set())
+        bucket.update(ids)
+        # 防御：单会话不可能真推几百部，超限说明异常（如 exclude 逻辑出 bug），重置以免堆积
+        if len(bucket) > 200:
+            _SESSION_RECOMMENDED[sid] = set()
+
+
+def _clear_recommended(sid: str) -> None:
+    """清空本会话记忆（池耗尽兜底用）。"""
+    if not sid or sid == "default":
+        return
+    with _SESSION_RECOMMENDED_LOCK:
+        _SESSION_RECOMMENDED.pop(sid, None)
+
+
+# ---------------------- 会话级「上一轮 find 筛选条件」 ----------------------
+# 用户反复吐槽「再推荐 / 换一个 / 还有别的」会脱离前文（如聊完爱情片再说「再推荐一部」，
+# 却推回非爱情片）。根因：_extract_params_rule 是无状态的，只看当前句，抽不到 genre。
+# 而 LLM 润色环节被「铁律」锁死只能照工具结果说，无法回补 genre——所以上下文继承
+# 必须做在【检索层】。这里记住本会话上一轮 find 的 genre/country/year/sort，续轮未明说时继承。
+_SESSION_LAST_FIND: dict[str, dict] = {}
+_SESSION_LAST_FIND_LOCK = threading.Lock()
+
+# 续轮推荐意图关键词：命中即视为「接着上一轮继续推荐」，可继承上一轮筛选条件。
+_FOLLOWUP_KW = [
+    "再推荐", "再推", "再给", "再整", "换一个", "换一部", "再来", "再来一个",
+    "再来一部", "还有", "别的", "其他", "其它", "另外", "类似的", "另一",
+    "重新推", "重新推荐", "继续推", "还来", "也来", "换换",
+]
+
+
+def _is_followup(m: str) -> bool:
+    """当前句是否「续轮推荐」意图（再推荐 / 换一个 / 还有别的…）。"""
+    return any(k in m for k in _FOLLOWUP_KW)
+
+
+def _get_last_find(sid: str) -> dict:
+    """取本会话上一轮 find 的筛选条件（查库前继承用）。匿名会话返回空。"""
+    if not sid or sid == "default":
+        return {}
+    with _SESSION_LAST_FIND_LOCK:
+        return dict(_SESSION_LAST_FIND.get(sid, {}))
+
+
+def _set_last_find(sid: str, genre: str, country: str, year, sort: str) -> None:
+    """记录本会话本轮 find 的筛选条件（查库后调用，供续轮继承）。"""
+    if not sid or sid == "default":
+        return
+    with _SESSION_LAST_FIND_LOCK:
+        _SESSION_LAST_FIND[sid] = {
+            "genre": genre or "",
+            "country": country or "",
+            "year": year or 0,
+            "sort": sort or "",
+        }
+
+
 class _Trace:
     """单次对话的可观测数据收集器。"""
 
@@ -225,10 +324,10 @@ class _Trace:
         self.mode: str = "deterministic"  # deterministic=规则路由主路径；autonomous=LLM 自主 function calling 主路径
 
 
-# 进程内响应缓存：同一问题短期复问直接复用答案（命中即记 cache_hit）。
-# 这是管理端「缓存命中率」指标的真实来源；用锁保证多线程（uvicorn 线程池）安全。
-_RESP_CACHE: dict[str, str] = {}
-_RESP_CACHE_LOCK = threading.Lock()
+# 注：早期版本曾用进程内 _RESP_CACHE 缓存「同问题复问」的答案，但该设计会让
+# 「重复提问/随机推荐」每次都返回同一份旧答案（用户明确反对），故已彻底移除。
+# 现在每次对话都真实走工具查询；管理端 cache_hit 字段恒为 False（仅保留兼容，
+# 指标会如实显示 0% 命中率，不会因无缓存而崩溃）。
 
 
 def _record_trace(session_id: str, query: str, intent: str, tr: "_Trace", answer: str, latency_ms: int):
@@ -326,6 +425,12 @@ def _make_llm():
         model=settings.llm_model or "glm-4-flash",
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url or None,
+        # 关键：必须开 streaming=True，否则 .stream() 不会发起真正的流式 HTTP 请求，
+        # 而是先完整生成、再把整段答案作为一个 chunk 一次性 yield —— 表现就是
+        # 「思考很久、然后一下子全吐出来」，看起来像流式失效。开启后 .stream() 才会
+        # 逐 token 产出，配合前端 getReader() 实现真正的逐字流式。
+        # （.invoke() 不受影响，仍走普通非流式请求。）
+        streaming=True,
         temperature=0.3,
         # 上限 + 重复惩罚：弱模型（glm-4-flash 免费档）偶发“重复列举”死循环，
         # 导致答案又长又臭、还拖慢首字。硬性限制输出长度，并降低重复概率。
@@ -388,6 +493,95 @@ def _find_title_in_text(text: str) -> str | None:
     return None
 
 
+def _extract_unknown_movie_name(m: str) -> str | None:
+    """从「问某部具体电影」的口语里抽取片名（库内未知也抽），覆盖常见点名句式，
+    用于 _find_title_in_text 为空（库内无此片）时兜底，确保仍先走 get_movie_info_by_name 查库。
+    仅返回 2~16 字、且非指代/疑问代词的候选，避免误伤「帮我挑一部好看的悬疑片」这类推荐句。
+
+    【根因背景】此前 _extract_params_rule 只认《》和库内已知片名，认不出「你知道X吗」这种
+    没书名号、且库里没有的片名，会退化成泛化 find_movies 返回 TOP 列表，弱模型随之凭训练
+    记忆编造该片简介（超能陆战队 bug 即此）。本函数把这类点名句式也归一到 movie_info 模式。
+    """
+    _STOP = {"这部", "那部", "这个", "那个", "它", "电影", "那部电影", "这部电影", "什么", "哪部"}
+    # 认知类动词（你知道/了解/认识/听过/看过/听说…），覆盖：
+    #   「你(有没有)听说过X吗」「你听过X吗」「你看过X吗」「你知道X吗」「听说X」
+    # 结尾 吗? 可选，兼容「你有没有听说过X」这种【没有吗】的口语。
+    _PATS = [
+        # 认知类动词（你知道/了解/认识/听过/看过/听说…），覆盖肯定式与「A-not-A 反复疑问」式：
+        #   肯定：你知道X / 你了解X / 你认识X / 你听说过X / 你听过X / 你看过X / 你看过X
+        #   A-not-A：你知不知道X / 你认不认识X / 你了不了解X（用「不」）
+        #           你听没听说过X / 你听没听X / 你看没看X / 你看过没看X（用「没+过」）
+        #           你不知道X / 你不认识X / 你没听说X（否定式，同样指向具体片名）
+        # 关键：A-not-A 形态里动词首字后紧跟「不/没」而非动词本体（如「你知|不|知道」），
+        #   不能只写「你知道」——否则「你知不知道火影忍者」在首字就匹配不到「知道」而整体失败、
+        #   退化成泛化检索返回 TOP 列表（火影忍者 bug 根因）。结尾 吗? 可选。
+        r"你(?:有没有)?(?:"
+        r"知不知道|认不认识|了不了解|听没听说过|看没看过|看过没看|听没听|看没看|"
+        r"不知道|不了解|不认识|没听说过|没听过|没看过|没听|没看|"
+        r"听说过|听过|看过|知道|了解|认识|听说|听|看"
+        r")[《]?([^《》，。？！\s]{2,16})[》]?吗?",
+        r"听说[过]?[《]?([^《》，。？！\s]{2,16})[》]?",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?讲[的是什]?[么么]",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?的(?:导演|演员|主角|剧情|简介|上映|评分)",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?好看吗",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?(?:怎么样|如何)",
+        r"(?:介绍|说说|讲讲|聊一聊)[一]?[下下]?[《]?([^《》，。？！\s]{2,16})[》]?",
+        r"[《]?([^《》，。？！\s]{2,16})[》]?是[一]?[部部]?什么电影",
+    ]
+    # 句末语气词 + 指代词，抓到片名后先剥掉（避免把「吗/的/这部」带进片名）
+    _PARTICLES = "《》的这部那部那个这个吗呢吧啊呀哦嘛"
+    # 片名后常跟的角色/属性/描述词，遇到即截断（防止贪心抓到「超能陆战队导演」「超能陆战队挺好看」）。
+    # 注意：只用【多字角色词】与【绝不会开头片名的副词】(挺/很/特别/非常)；
+    # 绝不加「超/还/最/真/也/又」等——它们会开头真实片名（超人/还珠格格/最后的武士/真爱），误杀。
+    _TERMINATORS = ("导演", "演员", "主演", "剧情", "简介", "上映", "评分", "讲的", "好看",
+                    "怎么样", "如何", "什么电影", "挺", "很", "特别", "非常")
+    for p in _PATS:
+        mt = re.search(p, m)
+        if not mt:
+            continue
+        nm = mt.group(1).strip(_PARTICLES)
+        for role in _TERMINATORS:
+            if role in nm:
+                nm = nm.split(role)[0]
+        # 过滤指代/疑问词（如「你知道这部电影叫什么吗」会误抓「这部电影叫什么」）
+        if not nm or nm in _STOP or len(nm) < 2:
+            continue
+        if any(b in nm for b in ("什么", "哪", "叫", "咋", "谁", "怎么", "名字", "电影", "影片")):
+            continue
+        return nm
+    return None
+
+
+def _extract_title_fragment(m: str) -> str | None:
+    """片名片段搜索：用户记不清完整片名、只记得「标题/片名/名字里有X」「片名带X」等。
+    返回标题片段（如「冒险王」），供 search_movies 做模糊匹配。
+
+    【为何必须在 genre 检测之前】「冒险王」里含类型词「冒险」，若先跑 _detect_genres_from_text
+    会被当成 genre=冒险，进而退化成 find_movies(genre=冒险) 推评分最高的冒险片（瞎推 bug 根因）。
+    故本函数在 _extract_params_rule 的 genre 步骤前执行，命中即走 name_search → search_movies。
+    """
+    # 捕获字符类刻意排除「的/这/那/有/哪/都/也/就/还/呢/吧/啊/吗/啥/怎/谁」等自然断词，
+    # 让片段在遇到「的电影 / 这三个字 / 那个电影」等赘余前就停住，避免贪心吞掉整句。
+    _FRAG_CH = r"[^，。？！\s，。？！、的这那有哪都也就还呢吧啊吗啥怎谁叫为是中上下放着]"
+    _PATS = [
+        # 显式标记「标题/片名/名字/电影名/剧名/片子/影片 + 里有/带/包含/是/叫」
+        r"(?:标题|片名|名字|电影名|影片名|剧名|片子|影片)[里中上]?[的有带包含叫为]\s*(" + _FRAG_CH + r"{1,16})",
+        # 「记得/忘了/只记得 + (标题/片名/名字) + 里有/带/包含/是/叫」
+        r"(?:记得|忘了|不记得|记不清|只记得)[^，。？！]{0,12}?(?:标题|片名|名字|电影名)[里中上]?[的有带包含叫为]\s*(" + _FRAG_CH + r"{1,16})",
+    ]
+    for p in _PATS:
+        mt = re.search(p, m)
+        if not mt:
+            continue
+        frag = mt.group(1)
+        # 剥掉末尾「这三个字 / 那几个字 / 几个字 / 个字」等量词语赘（用户常补「这三个字」）
+        frag = re.sub(r"^(这|那|几|个)?(三|几|一)?个字$", "", frag)
+        frag = frag.strip("的有带包含叫为是，。？！、 ")
+        if frag and 1 <= len(frag) <= 16:
+            return frag
+    return None
+
+
 # 参数提取提示词：让模型把用户问题转成结构化参数（模型只做"抽取"，不做"是否查库"的决策）
 _EXTRACT_PROMPT = """你是一个参数提取器。根据用户的问题，提取查询电影数据库所需的参数，只返回一段 JSON（不要任何额外文字、不要 markdown 代码块）。
 
@@ -397,7 +591,7 @@ _EXTRACT_PROMPT = """你是一个参数提取器。根据用户的问题，提�
     genre：类型，多个用逗号隔开（如 动画,冒险），没有则空字符串
     year：年份数字，没有则 0
     country：国家/地区中文（如 美国/日本），没有则空字符串
-    sort：排序 rating(评分)/popularity(热度)/year(年份)/release(上映日期)。**若用户要「分别按不同维度各推几部」（如「分别推一个评分最高和一个热度最高的电影」），把多个维度用英文逗号写在 sort 里（如 sort="rating,popularity"），并把 limit 设为每个维度想要的条数（「一个」→limit=1）。** 没有则空字符串
+    sort：排序 rating(评分)/popularity(热度)/year(年份)/release(上映日期)/random(随机，用于「随机/随便推荐一部」)。**若用户要「分别按不同维度各推几部」（如「分别推一个评分最高和一个热度最高的电影」），把多个维度用英文逗号写在 sort 里（如 sort="rating,popularity"），并把 limit 设为每个维度想要的条数（「一个」→limit=1）。** 用户说「随机/随便推荐」时填 random。没有则空字符串
     limit：想要的条数，没有则 0
 - mode="semantic"：用户按「剧情/主题/情感/氛围」描述想看的电影（如「讲时间循环」「结局治愈」「深夜一个人看」），没有具体片名也没有明确类型筛选。填 query（用户原意描述）。
 - mode="chat"：纯闲聊/问候/感谢（如「你好」「谢谢」「好的」），无需查库。
@@ -406,6 +600,7 @@ _EXTRACT_PROMPT = """你是一个参数提取器。根据用户的问题，提�
 示例：
 用户：「帮我找一些冒险题材的动画」→ {{"mode":"find","defer":false,"name":"","genre":"动画,冒险","year":0,"country":"","sort":"","limit":0}}
 用户：「你知道超能陆战队吗」→ {{"mode":"movie_info","defer":false,"name":"超能陆战队","genre":"","year":0,"country":"","sort":"","limit":0}}
+用户：「你有没有听说过超能陆战队」→ {{"mode":"movie_info","defer":false,"name":"超能陆战队","genre":"","year":0,"country":"","sort":"","limit":0}}
 用户：「讲时间循环的电影」→ {{"mode":"semantic","defer":false,"name":"","genre":"","year":0,"country":"","sort":"","limit":0,"query":"讲时间循环"}}
 用户：「谢谢」→ {{"mode":"chat","defer":false,"name":"","genre":"","year":0,"country":"","sort":"","limit":0}}
 用户：「你能给我推荐几个电影吗，我一会儿会给你要求」→ {{"mode":"find","defer":true,"name":"","genre":"","year":0,"country":"","sort":"","limit":0}}
@@ -435,6 +630,48 @@ def _extract_params(message: str) -> dict:
     return default
 
 
+def _extract_unknown_genre_phrase(m: str) -> str | None:
+    """抓出用户「想按某类电影找」但不在已知类型表里的那个「类别词」。
+
+    命中条件（全部满足）：
+    - 原话是「找电影/推荐」句式（含 推荐/想看/看/找/来/给我/推/介绍 等动词）；
+    - 动词后紧跟一个 1~6 字候选词（到 片/电影/题材/类型/风格/系/向/的/标点 为止）；
+    - 该候选词既不是标准类型、也不是已知同义词（即 _detect_genres_from_text(cand) 为空）；
+    - 且不是泛称/量词/疑问词（电影、好看、什么、一部…）。
+    返回该词（供语义检索兜底），否则 None。
+
+    【为何需要】「喜剧」打成「戏剧」、或说了一个库里没有的类别词时，
+    _detect_genres_from_text 抽不到任何已知类型 → genre 为空 → find_movies(genre="")
+    退化成全局搜索、弱模型凭记忆瞎编。这里把「用户明显在要一个未知类别」识别出来，
+    交给语义检索（项目已接 Qwen3-Embedding-8B 向量库）自主纠错/补全接近正确意图的电影。
+    """
+    _STOP = {"电影", "影片", "片子", "好看的", "好看", "不错", "的", "什么",
+             "啥", "几部", "哪些", "一部", "一个", "两个", "这个", "那个", "部", "篇"}
+    _PATS = [
+        # 动词 + 候选词 + 边界（片/电影/题材/类型/风格/系/向/的）
+        r"(?:推荐|想看|要看|看看|看|找|搜|来|给我|整|推|介绍|说说|讲讲|来部|来个|要部|要个|挑|选)\s*([^，。？！、片电影题材类型风格系向的]{1,6}?)\s*(?:片|电影|题材|类型|风格|系|向|的)",
+        # 动词 + 候选词 + 句末（无边界词，如「我想看戏剧」）；排除集含 片/电影，避免把泛称「X电影」整段当类别词
+        r"(?:推荐|想看|要看|看看|看|找|搜|来|给我|整|推|介绍|说说|讲讲|来部|来个|要部|要个|挑|选)\s*([^，。？！、片电影]{1,8})$",
+    ]
+    for p in _PATS:
+        mt = re.search(p, m)
+        if not mt:
+            continue
+        cand = mt.group(1).strip()
+        # 剥掉前置量词（一个/两/部/篇…）
+        cand = re.sub(r"^(一|两|二|三|四|五|几|这|那|个|部|篇|些)\s*", "", cand)
+        # 剥掉尾部泛称（电影/影片/片子/片），否则「X电影」会被整段当成类别词
+        cand = re.sub(r"(电影|影片|片子|片)$", "", cand)
+        if not cand or cand in _STOP:
+            continue
+        # 已知类型 / 同义词 → 不该走语义（那种 genre 非空，根本不会到这步，双保险）
+        if _detect_genres_from_text(cand):
+            continue
+        if 1 <= len(cand) <= 6:
+            return cand
+    return None
+
+
 def _extract_params_rule(message: str) -> dict:
     """确定性参数抽取（不依赖 LLM）：覆盖绝大多数「找电影/推荐」句式，速度快、零幻觉、
     不依赖弱模型是否会抽 JSON。作为【电影意图主路径】的参数来源，替代不稳定的 LLM 抽取。
@@ -459,6 +696,24 @@ def _extract_params_rule(message: str) -> dict:
         default["mode"] = "movie_info"
         default["name"] = bm.group(1).strip()
         return default
+    # 1.6) 口语点名某部具体电影（库内未知也抽片名，确保仍先走 get_movie_info_by_name 查库）
+    #      覆盖「你知道X吗 / X讲什么 / X的导演 / X好看吗 / 介绍一下X」等；
+    #      不抽《》（已在 1.5）与库内已知片名（已在 1），只兜底「没书名号且库里没有」的口语，
+    #      避免退化成泛化 find_movies 让弱模型凭记忆编造（超能陆战队 bug 根因）。
+    uname = _extract_unknown_movie_name(m)
+    if uname:
+        default["mode"] = "movie_info"
+        default["name"] = uname
+        return default
+    # 1.7) 片名片段搜索：用户记不清完整片名、只记得「标题/片名/名字里有X」「片名带X」等。
+    #      必须在 genre 检测（步骤2）【之前】执行，否则「冒险王」里的「冒险」会被当类型，
+    #      退化成 find_movies 推评分最高冒险片（用户实测 bug：「标题里有冒险王这三个字」→ 推回安昂传奇）。
+    #      命中即走 search_movies 做模糊匹配（如《奇幻变身大冒险》能被「冒险王」命中），而非 genre 检索。
+    frag = _extract_title_fragment(m)
+    if frag:
+        default["mode"] = "name_search"
+        default["name"] = frag
+        return default
     # 2) 类型（确定性识别，不看历史）
     genres = _detect_genres_from_text(m)
     default["genre"] = ",".join(genres)
@@ -482,16 +737,28 @@ def _extract_params_rule(message: str) -> dict:
         sorts.append("year")
     if any(k in m for k in ["上映日期", "上映"]):
         sorts.append("release")
+    # 随机/随便：明确要「随机/随便/随意推荐」时，用 random 排序（而非默认评分降序，
+    # 否则永远返回评分最高的那一部，造成「随机推十次都同一部」的离谱结果）。
+    if any(k in m for k in ["随机", "随便", "随意", "随机来", "随便来", "胡乱", "任意挑", "盲选"]):
+        sorts.append("random")
     # 去重保序
     default["sort"] = ",".join(dict.fromkeys(sorts))
-    # 6) 条数
-    lm = re.search(r"(\d+)\s*[部个]", m)
+    # 6) 条数（「篇」是用户常把电影当文章数的口语量词，一并纳入，否则「一篇/两篇」抽不到数→回退5）
+    lm = re.search(r"(\d+)\s*[部个篇]", m)
     if lm:
         default["limit"] = int(lm.group(1))
-    elif any(k in m for k in ["几部", "哪些", "哪几部", "有什么", "有哪些", "来几部", "推荐几", "推荐一些", "有哪些电影"]):
-        default["limit"] = 5
-    elif any(k in m for k in ["全部", "所有", "都给我", "都列", "都列出来"]):
-        default["limit"] = 20
+    else:
+        # 中文数词（无阿拉伯数字）：「一个 / 一部 / 一篇」→ 1，「两部 / 三部」→ 2 / 3 ……
+        # 否则「推荐一个冒险动画」因 limit 抽不到数字会回退成 5，与用户「只要一部」的诉求相悖。
+        cm = re.search(r"(十|九|八|七|六|五|四|三|两|二|一)\s*[部个篇]", m)
+        if cm:
+            _CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+                       "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            default["limit"] = _CN_NUM[cm.group(1)]
+        elif any(k in m for k in ["几部", "哪些", "哪几部", "有什么", "有哪些", "来几部", "推荐几", "推荐一些", "有哪些电影"]):
+            default["limit"] = 5
+        elif any(k in m for k in ["全部", "所有", "都给我", "都列", "都列出来"]):
+            default["limit"] = 20
     # 7) 语义检索：无具体类型/排序、且是「主题/情感/氛围」描述
     if not genres and not default["sort"] and any(
         k in m for k in ["治愈", "时间循环", "深夜", "一个人", "孤独", "感人", "温暖",
@@ -499,6 +766,35 @@ def _extract_params_rule(message: str) -> dict:
     ):
         default["mode"] = "semantic"
         default["query"] = m
+
+    # 8) 续轮「再推荐 / 换一个 / 还有别的」：若本轮【未明说】类型/地区/年份/排序，
+    #    自动继承上一轮 find 的条件（会话级记忆），解决无状态路由在续轮丢失 genre 的问题
+    #    （用户反复吐槽「再推荐脱离前文」）。本轮若显式给了新类型，则以本轮为准，不覆盖。
+    if _is_followup(m):
+        last = _get_last_find(_SESSION_ID_CTX.get())
+        if last:
+            if not default["genre"] and last.get("genre"):
+                default["genre"] = last["genre"]
+            if not default["country"] and last.get("country"):
+                default["country"] = last["country"]
+            if not default["year"] and last.get("year"):
+                default["year"] = last["year"]
+            if not default["sort"] and last.get("sort"):
+                default["sort"] = last["sort"]
+    # 2.5) 语义兜底：用户明显想按「某类电影」找，但抽到的 genre 为空——
+    #      说明他要的那个「类」不在已知类型表（错别字/未知分类，如「喜剧」打成「戏剧」、
+    #      或说了一个库里没有的类别词）。若仍走 find_movies(genre="") 会退化成全局搜索、
+    #      弱模型凭记忆瞎编；正确做法是把原话作为语义描述走 semantic_search_movies
+    #      （项目已接 Qwen3-Embedding-8B 向量库），让 RAG 自主纠错/补全接近正确意图的电影。
+    #      约束：①genre 确实空（已知/同义词类型已被前序识别，不会到这）；
+    #            ②无显式排序意图（带 sort 时尊重排序走 find 全局更合理）；
+    #            ③非 defer（「先别急」之类不查库）；④原话里确含一个「未知类别词」。
+    if not default["genre"] and not default["sort"] and not default["defer"]:
+        unknown = _extract_unknown_genre_phrase(m)
+        if unknown:
+            default["mode"] = "semantic"
+            default["query"] = m  # 用完整原话做语义 query，比孤零零一个词更准
+            return default
     return default
 
 
@@ -508,6 +804,7 @@ _SORT_LABEL = {
     "popularity": "热度最高",
     "year": "年份",
     "release": "上映日期",
+    "random": "随机",
 }
 
 
@@ -534,6 +831,14 @@ def _route_tool(params: dict, message: str, tr=None) -> str:
                 tr.tool_calls.append({"name": "semantic_search_movies", "args": {"query": params.get("query") or message, "top_k": 5}})
             return str(tool.invoke({"query": params.get("query") or message, "top_k": 5}))
 
+        # 片名片段搜索：用户只记得标题里的字（如「标题里有冒险王这三个字」）→ 走 search_movies 模糊匹配，
+        # 而非退化成 genre 检索（「冒险王」含类型词「冒险」会被误判）。
+        if mode == "name_search" and params.get("name"):
+            tool = _tool_by_name("search_movies")
+            if tr is not None:
+                tr.tool_calls.append({"name": "search_movies", "args": {"keyword": params["name"]}})
+            return str(tool.invoke({"keyword": params["name"]}))
+
         # 默认 / find：按条件筛选
         # 注意：必须传原始默认值（0 / ""），不要传 None——
         # find_movies 的 Pydantic schema 要求 year 为 int、genre/country/sort 为 str，
@@ -550,31 +855,61 @@ def _route_tool(params: dict, message: str, tr=None) -> str:
         if not sorts:
             sorts = [""]  # 默认按评分降序
 
-        blocks = []
-        for s in sorts:
-            if tr is not None:
-                tr.tool_calls.append({"name": "find_movies", "args": {"genre": genre, "year": year, "country": country, "sort": s, "limit": per_limit}})
-            raw = str(tool.invoke({
-                "genre": genre,
-                "year": year,
-                "country": country,
-                "sort": s,
-                "limit": per_limit,
-            }))
-            label = _SORT_LABEL.get(s, "默认") if s else "评分最高（默认）"
-            blocks.append(f"【排序：{label}】\n{raw}")
-        # 诚实告知：仅当用户「明确要 N 部」、且资料库「真实不足 N 部」时才补一句，
-        # 且数字用工具结果里的「真实总条数（共 X 部符合条件）」——不受 limit 截断影响，
-        # 避免报出错误数量。用户要的数量已满足（如要 2 部已列出 2 部）时，绝不画蛇添足补数量声明。
-        if requested_limit > 0 and blocks:
-            m_tot = re.search(r"共 (\d+) 部符合条件", blocks[-1])
-            true_total = int(m_tot.group(1)) if m_tot else 0
-            if 0 < true_total < requested_limit:
-                blocks[-1] += (
-                    f"\n（注：资料库里符合条件的电影目前共 {true_total} 部，已全部列出，"
-                    f"未能凑满你想要的 {requested_limit} 部。）"
-                )
-        return "\n\n".join(blocks)
+        # 会话级「已推荐去重」：本会话之前推过的电影，这次优先排除，
+        # 让「再推荐 / 换一个 / 随机」不再命中刚推过的同一部（用户明确吐槽过的点）。
+        sid = _SESSION_ID_CTX.get()
+        exclude_ids = _recommended_exclude(sid)
+
+        def _run_find_blocks(excl):
+            blks = []
+            for s in sorts:
+                if tr is not None:
+                    tr.tool_calls.append({"name": "find_movies", "args": {"genre": genre, "year": year, "country": country, "sort": s, "limit": per_limit, "exclude_ids": list(excl)}})
+                raw = str(tool.invoke({
+                    "genre": genre,
+                    "year": year,
+                    "country": country,
+                    "sort": s,
+                    "limit": per_limit,
+                    "exclude_ids": list(excl),
+                }))
+                label = _SORT_LABEL.get(s, "默认") if s else "评分最高（默认）"
+                blks.append(f"【排序：{label}】\n{raw}")
+            return blks
+
+        def _append_shortage_note(blks):
+            # 诚实告知：仅在「资料库真实不足用户要的数量」时才补一句（如用户要 5 部、库里只有 3 部）。
+            # 其余情况（库里充足 / 用户只要 1 部）一律不报总数——报总数对用户体验是噪音，
+            # 且极易诱发弱模型把"找到了 M 部"误说成"只有 M 部"（数量幻觉复发点）。
+            # （用户明确要求：剩余足够时不用调取数量说明，否则交流体验太差。）
+            if requested_limit > 0 and blks:
+                m_tot = re.search(r"共 (\d+) 部符合条件", blks[-1])
+                true_total = int(m_tot.group(1)) if m_tot else 0
+                if 0 < true_total < requested_limit:
+                    blks[-1] += (
+                        f"\n（注：资料库里符合条件的电影目前共 {true_total} 部，已全部列出，"
+                        f"未能凑满你想要的 {requested_limit} 部。）"
+                    )
+
+        blocks = _run_find_blocks(exclude_ids)
+        _append_shortage_note(blocks)
+        combined = "\n\n".join(blocks)
+
+        # 池耗尽兜底：若因排除已推荐而查无结果（该会话把符合条件的电影都推过了），
+        # 清空记忆再查一次，保证「还有得推」而非空手而归。
+        if exclude_ids and "未找到符合条件" in combined:
+            _clear_recommended(sid)
+            exclude_ids = set()
+            blocks = _run_find_blocks(exclude_ids)
+            _append_shortage_note(blocks)
+            combined = "\n\n".join(blocks)
+
+        # 记录本次推荐的电影 id，供后续「再推荐 / 随机」继续去重
+        _record_recommended(sid, combined)
+        # 记录本次 find 的筛选条件，供续轮「再推荐 / 换一个」继承上下文
+        # （解决无状态路由在续轮丢失 genre、退化成全局搜索的问题）
+        _set_last_find(sid, genre, country, year, params.get("sort") or "")
+        return combined
     finally:
         _USER_QUERY_CTX.reset(token)
 
@@ -586,10 +921,11 @@ _RESPOND_TEMPLATE = """你是智影影评网站的智能助手，正在和用户
 - 你只能依据下面【工具结果】里给出的信息来谈论电影。禁止编造任何电影名、评分、年份、类型、地区、简介。
 - 若【工具结果】是「未找到 / 没有符合条件的电影」，就如实、友好地告诉用户资料库里暂时没有这部电影（可能还没收录），并可以友好地问一句「你想看什么类型的？我帮你推荐类似的」。
 - 若【工具结果】是一组电影，就用自然、亲切的口吻介绍这批电影（可加一句引导语，例如「给你挑了几部符合要求的电影：」），不要生硬复述原始格式；保留片名、评分、类型等关键信息即可。
-- **禁止自行编造数量声明**：你**绝不可以**自己冒出「资料库里这类电影目前只有 X 部，都列给你了」之类的句子。只有当【工具结果】里出现了系统生成的「（注：资料库里符合条件的电影目前共 M 部…未能凑满你想要的 N 部）」这类**明确短缺提示**时，你才需要把「资料库里这类电影目前只有 M 部，都列给你了」的意思**如实转达**给用户（M 以提示里的数字为准）。用户要的数量已经满足时（例如用户要 2 部、你也列出了 2 部），直接自然介绍电影即可，**不要画蛇添足补一句数量声明**。绝不要为了凑数去编造资料库里没有的片名/评分/年份；若想补充资料库【之外】的电影，必须先明确标注「（资料库外 · 仅供参考）」，且不得伪装成资料库数据。优先做法：先如实交差资料库里的电影。
+- **禁止自行编造数量声明（弱模型极易在此幻觉，务必遵守）**：你**绝不可以**自己冒出「资料库里这类电影目前只有 X 部，都列给你了」之类的句子；**尤其当你本次只列出了 M 部、但【工具结果】里的系统提示说共有 N 部（N>M）时，绝不可说「只有 M 部」**——那会把"找到了 M 部"误说成"总共只有 M 部"，是典型数量幻觉。只有当【工具结果】里出现了系统生成的提示时，你才按提示里的数字如实转达：①「（注：…共 M 部…未能凑满你想要的 N 部）」**短缺提示**→自然说「资料库里这类电影目前只有 M 部，都列给你了」（M 以提示数字为准）；②「（注：…共 N 部，已为你列出其中的 M 部）」**充足提示**→自然说「资料库里这类电影共 N 部，我先给你列了评分最高的 M 部」（N、M 均以提示数字为准，**充足时绝不可省略成「只有 M 部」**）。用户要的数量已满足且【工具结果】里无任何上述提示时，直接自然介绍电影即可，**不要画蛇添足补数量声明**。绝不要编造资料库里没有的片名/评分/年份；补充资料库外电影须标注「（资料库外 · 仅供参考）」。优先做法：先如实交差资料库里的电影。**再次强调**：【工具结果】里已经写明了符合条件的真实总数（形如「资料库里符合条件的电影目前共 N 部」），你直接使用这个数字即可；**绝对禁止自己另写「共 X 部」「只有 X 部」「都列给你了」之类的总结数量句**——那会被判定为编造幻觉。
+- **两条硬性输出要求（违反即视为严重失误）**：(a) **用户只要「一部」电影时（如「推荐一部/来一部/随便来一部」），【工具结果】里不会出现任何数量提示，你也绝对不要自行补充「资料库里共 N 部」「都列给你了」之类的总结**——直接自然介绍那一部电影即可，报总数对用户毫无意义且极易误导（例：只推了一部却说"共7部都列给你了"是完全错误、毫无意义的）。(b) **无论何种情况，【工具结果】里给出的每一部电影，你都必须把片名（至少）说出来**，绝不可只复述末尾的数量提示而把电影本身省略掉。尤其是用户说「再推荐一个/换一个/再来一部」时，必须把新推出来的那部电影名字点出来，不能只回一句数量、让对话看起来"没有推荐任何电影"。
 - 若【工具结果】是一段「单部电影资料」（以《片名》开头、含导演/演员/评分/简介等字段），你必须介绍【那部电影】本身。特别注意：即使用户的话里出现了「你的名字」这类措辞，只要工具结果是一份电影资料，就说明用户在问那部【电影】（例如《你的名字。》），你只能介绍该电影；**绝不要**把它理解成在问「助手你叫什么名字」，也**绝不要**输出任何关于「助手身份 / 助手名字 / 我是谁」的内容。
 - 若【工具结果】包含多个以「【排序：xxx】」开头的分组，说明是按不同维度（如评分最高 / 热度最高）分别查到的电影。请【分别、逐一】介绍每个分组，并明确点出该组是按什么维度排的（如「这是评分最高的一部」「这是热度最高的一部」）；不同分组往往是不同的电影，绝对不要把它们混为一谈、也不要只介绍其中一个而漏掉其它分组。
-- 【工具结果】里的「【排序：xxx】」只是内部分组标记，组织答案时不要原样照抄这些标记，用自然说法带出（如「按评分排，最高的是…」「按热度排，最高的是…」）。若某组末尾出现了系统生成的「（注：资料库里…共 N 部…未能凑满你想要的 M 部）」这类**明确短缺提示**，才自然地转达给用户（如「不过资料库里这类电影目前只有 N 部，都列给你了」，数字以提示为准）；【工具结果】里没有此类提示时，不要自己添加任何数量声明。
+- 【工具结果】里的「【排序：xxx】」只是内部分组标记，组织答案时不要原样照抄这些标记，用自然说法带出（如「按评分排，最高的是…」「按热度排，最高的是…」）。若某组末尾出现了系统生成的提示——「（注：资料库里…共 N 部…未能凑满你想要的 M 部）」**短缺提示** 或「（注：资料库里…共 N 部，已为你列出其中的 M 部）」**充足提示**——必须**严格按提示里的 N 数字**自然地转达给用户（短缺→「资料库里这类电影目前只有 N 部，都列给你了」；充足→「资料库里这类电影共 N 部，我先给你列了 M 部」，**充足时绝不可说「只有 M 部」**）；数字一律以提示为准，不得自行改动；【工具结果】里没有此类提示时，不要自己添加任何数量声明。
 - 绝对不要输出任何工具调用语法（如 function_name(...)）。只输出一段自然中文回复。
 
 【对话上文】
@@ -692,11 +1028,46 @@ def _respond_defer(message: str, history) -> str:
     return _llm_reply(prompt, [], message)
 
 
-def _respond_result(message: str, raw_result: str, history) -> str:
+# ---------------------------------------------------------------------------
+# 数量声明清洗：弱模型偶尔不听 prompt 铁律，自编「资料库共 N 部 / 都列给你了」。
+# 仅当数字与工具真实总数不符时才整句删除，避免误伤代码追加的诚实短缺提示。
+# 诚实提示格式为「资料库里符合条件的电影目前共 M 部…」（不以「这类/目前共」开头），
+# 不会被下面的正则命中，故安全保留。
+# ---------------------------------------------------------------------------
+_COUNT_CLAIM_RE = re.compile(
+    r"资料库里(?:这[类种]|目前)?(?:的)?(?:电影|影片)?(?:目前)?共\s*\d+\s*部"
+    r"(?:，?都列给?你(?:了|出来)?|，?已全部?列出|，?都列出来)?。?"
+)
+
+
+def _true_total_from_raw(raw: str) -> int:
+    """从工具结果抽真实总条数（find_movies 返回『共 X 部符合条件』）。"""
+    m = re.search(r"共\s*(\d+)\s*部符合条件", raw or "")
+    return int(m.group(1)) if m else 0
+
+
+def _sanitize_polish(answer: str, true_total: int) -> str:
+    """剔除润色 LLM 自编的数量声明；数字与工具真实总数一致（诚实提示）则保留。"""
+    if true_total <= 0:
+        return answer
+
+    def _repl(mm):
+        num = re.search(r"共\s*(\d+)\s*部", mm.group(0))
+        if num and int(num.group(1)) != true_total:
+            return ""  # 数字对不上 → 判定为编造，整句删除
+        return mm.group(0)  # 数字吻合（代码诚实提示）→ 保留
+
+    cleaned = _COUNT_CLAIM_RE.sub(_repl, answer)
+    # 删除后可能留下句首游离标点（如「。给你挑了几部…」），清理掉
+    return re.sub(r"^[。，、\s]+", "", cleaned).strip()
+
+
+def _respond_result(message: str, raw_result: str, history, true_total: int = 0) -> str:
     prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(history))
                                 .replace("{question}", message)
                                 .replace("{result}", raw_result))
-    return _llm_reply(prompt, [], message)
+    answer = _llm_reply(prompt, [], message)
+    return _sanitize_polish(answer, true_total)
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +1227,7 @@ def _agent_run_with_guardrail(message: str, history, tr=None) -> str | None:
         return resp.content or ""
     if tool_ever_called:
         # 最终答案用确定性模板把【工具真实结果】自然复述（不带工具绑定 → 不会泄工具语法、零幻觉）
+        # 注意：本函数只做「工具结果的格式化」，不干预模型自主选/调工具的过程（function calling 由上面循环负责）。
         return _respond_result(message, "\n\n".join(combined_raw), history)
     # 步数耗尽仍未调到工具 → 交给上层退回确定性路由
     return None
@@ -899,6 +1271,8 @@ def _agent_run_with_guardrail_stream(message: str, history, tr=None):
             continue
         break
     if tool_ever_called:
+        # 最终答案用确定性模板把【工具真实结果】自然复述（不带工具绑定 → 不会泄工具语法、零幻觉）
+        # 注意：本函数只做「工具结果的格式化」，不干预模型自主选/调工具的过程（function calling 由上面循环负责）。
         raw = "\n\n".join(combined_raw)
         yield from _respond_result_stream(message, raw, history)
         return
@@ -926,6 +1300,51 @@ def _not_found_reply(name: str | None = None) -> str:
     )
 
 
+# —— 库外具体电影：方案1 回复（公开知识作答 + 代码强制免责声明）——
+# 设计前提：get_movie_info_by_name 已经先被调用且返回「未找到」，即已确认资料库无该片（DB-first 不变）。
+# 之后允许模型基于公开知识介绍，但【免责声明由代码追加】，不依赖模型自觉，确保一定出现、不会被漏掉。
+_NOT_FOUND_KNOWLEDGE_DISCLAIMER = "（注：资料库暂未收录《{name}》，以下内容由模型基于公开知识生成，仅供参考。）"
+
+_NOT_FOUND_KNOWLEDGE_TEMPLATE = """你是一个电影知识助手。用户问的是《{name}》。
+
+资料库里目前没有收录这部电影，你无法从资料库获取它的官方数据。请基于你的公开知识，用中文简要、自然地介绍这部电影，帮助用户：
+- 一句话定位（如「《{name}》是 Y 年 Z 国的一部 A 类型电影」）
+- 导演、主要演员
+- 剧情梗概（2-3 句，不剧透关键反转）
+- 口碑/评价（如获奖、影评共识；可以说「口碑不错」，但不要编造具体评分/票房数字，除非你非常确定）
+- 风格与适合人群（1 句）
+
+注意（务必遵守）：
+1. 不要说「资料库里有这部电影」「根据资料库」之类的话——它根本不在资料库里。
+2. 不要编造你不确定的人物姓名、具体票房/评分数字；不确定就笼统表述。
+3. 只介绍《{name}》这一部，不要跑题去推荐别的电影（除非用户明确要求）。
+4. 语气像朋友安利，自然友好，不要列成生硬的条目堆。
+
+用户原话：{question}
+对话历史：
+{history}
+"""
+
+
+def _not_found_knowledge_reply(name: str, message: str, history) -> str:
+    """库外具体电影（非流式）：模型用公开知识作答，代码强制追加免责声明，返回完整字符串。"""
+    prompt = (_NOT_FOUND_KNOWLEDGE_TEMPLATE.replace("{name}", name or "")
+              .replace("{history}", _fmt_history(history))
+              .replace("{question}", message))
+    ans = "".join(_llm_reply_stream(prompt, [], message))
+    return ans + "\n\n" + _NOT_FOUND_KNOWLEDGE_DISCLAIMER.format(name=name or "")
+
+
+def _not_found_knowledge_reply_stream(name: str, message: str, history):
+    """库外具体电影（流式）：逐 token 产出模型作答，结束时代码强制追加免责声明。"""
+    prompt = (_NOT_FOUND_KNOWLEDGE_TEMPLATE.replace("{name}", name or "")
+              .replace("{history}", _fmt_history(history))
+              .replace("{question}", message))
+    for t in _llm_reply_stream(prompt, [], message):
+        yield t
+    yield "\n\n" + _NOT_FOUND_KNOWLEDGE_DISCLAIMER.format(name=name or "")
+
+
 def _deterministic_movie_path(message: str, history, tr=None) -> str:
     """电影意图【主路径】：用我们已验证可靠的「代码抽参 + 代码调工具 + 自然语言」路径（仍零幻觉）。
     代码直接调工具（不再依赖弱模型会不会 function calling），100% 可靠、只多 1 次 LLM 润色。
@@ -943,9 +1362,12 @@ def _deterministic_movie_path(message: str, history, tr=None) -> str:
             return _respond_defer(message, history)
         raw = _route_tool(params, message, tr)
     if _is_not_found(raw):
-        # 资料库明确未收录 → 确定性回复，绝不交给 LLM 自由发挥（防弱模型凭记忆编造）
+        # 库外具体电影（用户点名、资料库未收录）→ 方案1：公开知识作答 + 代码强制免责声明
+        nm = forced_title or (params.get("name") if (params and params.get("mode") == "movie_info") else None)
+        if nm:
+            return _not_found_knowledge_reply(nm, message, history)
         return _not_found_reply(forced_title)
-    return _respond_result(message, raw, history)
+    return _respond_result(message, raw, history, _true_total_from_raw(raw))
 
 
 def _run_deterministic_stream(message: str, history, tr=None):
@@ -963,8 +1385,8 @@ def _run_deterministic_stream(message: str, history, tr=None):
             tr.tool_calls.append({"name": "get_movie_info_by_name", "args": {"name": forced_title}})
         raw = str(tool.invoke({"name": forced_title}))
         if _is_not_found(raw):
-            # 资料库明确未收录 → 确定性回复，绝不交给 LLM 自由发挥（防弱模型凭记忆编造）
-            yield _not_found_reply(forced_title)
+            # 库外具体电影（已知片名但查库落空，罕见）→ 方案1：公开知识作答 + 代码强制免责声明
+            yield from _not_found_knowledge_reply_stream(forced_title, message, history)
             return
         yield from _respond_result_stream(message, raw, history)
         return
@@ -978,14 +1400,26 @@ def _run_deterministic_stream(message: str, history, tr=None):
         return
     raw = _route_tool(params, message, tr)
     if _is_not_found(raw):
-        # 资料库明确未收录 → 确定性回复，绝不交给 LLM 自由发挥
-        yield _not_found_reply(None)
+        # 库外具体电影（用户点名、资料库未收录）→ 方案1：模型用公开知识作答 + 代码强制免责声明
+        nm = params.get("name") if params.get("mode") == "movie_info" else None
+        if nm:
+            yield from _not_found_knowledge_reply_stream(nm, message, history)
+        else:
+            yield _not_found_reply(None)
         return
     yield from _respond_result_stream(message, raw, history)
 
 
 def _respond_result_stream(message: str, raw_result: str, history):
-    """_respond_result 的流式版：用 stream=True 逐 token 产出最终自然语言答案。"""
+    """_respond_result 的流式版：真·逐 token 产出（恢复实时流式）。
+
+    关键教训：上一版为做「数量清洗」把 LLM 整段输出先 ``"".join`` 缓冲、清洗完再按 2 字/块吐，
+    导致电影/推荐这条最常用路径**完全不实时流式**（长空白 → 再 2 字蹦），用户感知为「流式失效」。
+    现改为直接 ``yield from _llm_reply_stream``：LLM 每产出一个 token 就立刻推给前端。
+    数量幻觉改「源头预防」：_RESPOND_TEMPLATE 已禁止模型自编「共 N 部」，且工具结果里
+    已含真实总数（第 588 行注入「共 M 部符合条件」），模型直接照说即可，无需事后缓冲清洗。
+    非流式 _respond_result 仍保留 _sanitize_polish 硬兜底。
+    """
     prompt = (_RESPOND_TEMPLATE.replace("{history}", _fmt_history(history))
                                 .replace("{question}", message)
                                 .replace("{result}", raw_result))
@@ -1010,7 +1444,11 @@ def _deterministic_movie_path_stream(message: str, history, tr=None):
             return  # defer 在流式主流程已有独立分支处理，不会走到这
         raw = _route_tool(params, message, tr)
     if _is_not_found(raw):
-        # 资料库明确未收录 → 确定性回复，绝不交给 LLM 自由发挥
+        # 库外具体电影（用户点名、资料库未收录）→ 方案1：公开知识作答 + 代码强制免责声明
+        nm = forced_title or (params.get("name") if (params and params.get("mode") == "movie_info") else None)
+        if nm:
+            yield from _not_found_knowledge_reply_stream(nm, message, history)
+            return
         yield _not_found_reply(forced_title)
         return
     yield from _respond_result_stream(message, raw, history)
@@ -1050,21 +1488,8 @@ def _run_chat(message: str, session_id: str = "default") -> tuple[str, dict]:
     tr.mode = "autonomous" if is_autonomous() else "deterministic"  # 提前确定，供缓存键与埋点使用
     trace_token = _TRACE_CTX.set(tr)
     uq_token = _USER_QUERY_CTX.set(message)  # 供 find_movies 做「类型词自动抽取」兜底
+    sid_token = _SESSION_ID_CTX.set(session_id)  # 供「会话级已推荐去重」识别会话
     try:
-        # —— 响应缓存：同问题短期复问直接复用，命中即标记 cache_hit ——
-        # 缓存键带 mode，确保「同问题切到另一种模式」会重新跑（否则对比演示会命中旧缓存）。
-        cache_key = f"{tr.mode}|{message.strip().lower()}"
-        with _RESP_CACHE_LOCK:
-            cached = _RESP_CACHE.get(cache_key)
-        if cached is not None:
-            tr.cache_hit = True
-            latency = int((time.time() - t0) * 1000)
-            _record_trace(session_id, message, "cache_hit", tr, cached, latency)
-            return cached, {
-                "intent": "cache_hit", "tool_calls": [], "used_guardrail": False,
-                "cache_hit": True, "latency_ms": latency,
-            }
-
         intent = _classify_intent(message)
         store = _get_history(session_id)
         history = list(store.messages)
@@ -1110,12 +1535,11 @@ def _run_chat(message: str, session_id: str = "default") -> tuple[str, dict]:
             "mode": tr.mode,
         }
         _record_trace(session_id, message, intent, tr, answer, latency)
-        with _RESP_CACHE_LOCK:
-            _RESP_CACHE[cache_key] = answer
         return answer, meta
     finally:
         _safe_reset(uq_token)
         _safe_reset(trace_token)
+        _safe_reset(sid_token)
 
 
 def chat_stream(message: str, session_id: str = "default"):
@@ -1136,23 +1560,8 @@ def _run_chat_stream(message: str, session_id: str = "default"):
     tr.mode = "autonomous" if is_autonomous() else "deterministic"  # 提前确定，供缓存键与埋点使用
     trace_token = _TRACE_CTX.set(tr)
     uq_token = _USER_QUERY_CTX.set(message)  # 供 find_movies 做「类型词自动抽取」兜底
+    sid_token = _SESSION_ID_CTX.set(session_id)  # 供「会话级已推荐去重」识别会话
     try:
-        # —— 响应缓存：同问题短期复问直接复用，命中即标记 cache_hit ——
-        # 缓存键带 mode，确保「同问题切到另一种模式」会重新跑（否则对比演示会命中旧缓存）。
-        cache_key = f"{tr.mode}|{message.strip().lower()}"
-        with _RESP_CACHE_LOCK:
-            cached = _RESP_CACHE.get(cache_key)
-        if cached is not None:
-            tr.cache_hit = True
-            latency = int((time.time() - t0) * 1000)
-            _record_trace(session_id, message, "cache_hit", tr, cached, latency)
-            yield {"type": "token", "text": cached}
-            yield {"type": "done", "meta": {
-                "intent": "cache_hit", "tool_calls": [], "used_guardrail": False,
-                "cache_hit": True, "latency_ms": latency,
-            }}
-            return
-
         intent = _classify_intent(message)
         store = _get_history(session_id)
         history = list(store.messages)
@@ -1224,9 +1633,8 @@ def _run_chat_stream(message: str, session_id: str = "default"):
             "mode": tr.mode,
         }
         _record_trace(session_id, message, intent, tr, full, latency)
-        with _RESP_CACHE_LOCK:
-            _RESP_CACHE[cache_key] = full
         yield {"type": "done", "meta": meta}
     finally:
         _safe_reset(uq_token)
         _safe_reset(trace_token)
+        _safe_reset(sid_token)

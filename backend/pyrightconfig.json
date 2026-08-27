@@ -1,0 +1,6 @@
+{
+  "include": ["."],
+  "extraPaths": ["D:/Study/AI大模型相关/Agent/llm-pro/backend"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}

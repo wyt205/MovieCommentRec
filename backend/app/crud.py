@@ -46,11 +46,13 @@ COUNTRY_ALIAS = {
 # ---------------------- 电影 ----------------------
 def get_movies(db: Session, skip: int = 0, limit: int = 20, keyword: str | None = None,
                genre: str | None = None, year: int | None = None,
-               country: str | None = None, sort: str = "rating"):
+               country: str | None = None, sort: str = "rating",
+               exclude_ids: list = None):
     """电影列表，支持 关键词 / 类型 / 年份 / 国家地区 任意组合筛选与排序。
 
     sort: rating(按评分降序) | popularity(按热度降序) | release(按上映时间降序)
-          | year(按年份降序) | recent(按入库时间降序)
+          | year(按年份降序) | recent(按入库时间降序) | random(随机，用于「随机/随便推荐」)
+    exclude_ids: 排除指定 id 列表（会话级「已推荐去重」用，避免「再推荐/换一个/随机」反复命中同一部）。
     country 接受中文或英文，内部会先映射到库内英文存储再做 LIKE 匹配。
     """
     q = db.query(models.Movie)
@@ -69,6 +71,9 @@ def get_movies(db: Session, skip: int = 0, limit: int = 20, keyword: str | None 
     if country:
         country_en = COUNTRY_ALIAS.get(country.strip(), country.strip())
         q = q.filter(models.Movie.country.contains(country_en))
+    if exclude_ids:
+        # 会话级去重：排除本轮之前已推荐过的电影 id
+        q = q.filter(models.Movie.id.notin_(exclude_ids))
     if sort == "popularity":
         q = q.order_by(models.Movie.popularity.desc())
     elif sort == "release":
@@ -77,17 +82,24 @@ def get_movies(db: Session, skip: int = 0, limit: int = 20, keyword: str | None 
         q = q.order_by(models.Movie.year.desc())
     elif sort == "recent":
         q = q.order_by(models.Movie.created_at.desc())
+    elif sort == "random":
+        # 随机排序：MySQL 用 rand()，SQLite 用 random()（本项目生产库为 MySQL）
+        if db.bind.dialect.name == "sqlite":
+            q = q.order_by(func.random())
+        else:
+            q = q.order_by(func.rand())
     else:  # rating 默认
         q = q.order_by(models.Movie.rating.desc())
     return q.offset(skip).limit(limit).all()
 
 
 def count_movies(db: Session, genre: str | None = None, year: int | None = None,
-                 country: str | None = None) -> int:
+                 country: str | None = None, exclude_ids: list = None) -> int:
     """返回符合 类型/年份/地区 组合的「真实总条数」（不受 limit 影响）。
 
     与 get_movies 用同一套过滤逻辑，但只 COUNT 不返回行。供「诚实告知缺量」用——
     例如用户要 5 部、库里只有 4 部时，必须报真实的 4 而不是被 limit 截断后的数字。
+    exclude_ids 与 get_movies 一致，使「去重后还剩几部」的计数也真实。
     """
     q = db.query(models.Movie)
     if genre:
@@ -99,6 +111,8 @@ def count_movies(db: Session, genre: str | None = None, year: int | None = None,
     if country:
         country_en = COUNTRY_ALIAS.get(country.strip(), country.strip())
         q = q.filter(models.Movie.country.contains(country_en))
+    if exclude_ids:
+        q = q.filter(models.Movie.id.notin_(exclude_ids))
     return q.count()
 
 

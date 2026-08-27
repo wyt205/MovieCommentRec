@@ -1,0 +1,14 @@
+[project]
+name = "llm-pro-backend"
+version = "0.1.0"
+description = "智影 CineSage 电影推荐 Agent 后端"
+requires-python = ">=3.11"
+
+# 依赖清单见 backend/requirements.txt（运行时用 conda llm-pro 环境安装）。
+# 本文件主要用于让 IDE（PyCharm / VSCode / pyright）正确识别项目结构与解释器。
+
+[tool.pyright]
+# backend 目录即源码根：from app... 在此可解析
+extraPaths = ["."]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

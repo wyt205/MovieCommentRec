@@ -1,4 +1,10 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# .env 用绝对路径加载，杜绝「CLI 与启动器 cwd 不同导致相对路径 .env 解析不到」的隐性故障
+# config.py 位于 backend/app/core/，上溯 3 层到 backend/ 才是正确的 .env 位置
+_ENV_FILE = str(Path(__file__).resolve().parents[2] / ".env")
 
 
 class Settings(BaseSettings):
@@ -12,7 +18,8 @@ class Settings(BaseSettings):
     # 支持任意 OpenAI 兼容协议：GLM-4-Flash / 讯飞 Ultra / GPT 等。
     llm_api_key: str = ""          # 模型 API Key
     llm_base_url: str = ""         # OpenAI 兼容端点，如 GLM-4-Flash: https://open.bigmodel.cn/api/paas/v4
-    llm_model: str = "glm-4-flash-250414"  # 模型名
+    llm_model: str = "glm-4-flash"  # 模型名（用无后缀的 glm-4-flash：永久免费无限、不被限流；
+                                     # 带快照后缀的 glm-4-flash-250414 不在免费池、TTFT 高达 18s）
 
     # ---- 嵌入模型（RAG 语义检索）----
     # 星火 MaaS 免费 Qwen3-Embedding-8B，OpenAI 兼容 /v2/embeddings，返回 768 维向量。
@@ -21,7 +28,7 @@ class Settings(BaseSettings):
     embedding_base_url: str = "https://maas-api.cn-huabei-1.xf-yun.com/v2"
     embedding_model: str = "xop3qwen8bembedding"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8")
 
 
 settings = Settings()

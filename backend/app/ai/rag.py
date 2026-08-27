@@ -7,12 +7,20 @@
 等额外服务与依赖，部署更省事。
 """
 
-from sqlalchemy import select
+import datetime
+import time
+
+from sqlalchemy import select, text
 
 import numpy as np
 
 from app import models
-from app.ai.embeddings import embed_query, embed_texts
+from app.ai.embeddings import (
+    embed_query,
+    embed_texts,
+    get_embedder,
+    _embed_with_retry,
+)
 from app.core.config import settings
 from app.db.database import Base, SessionLocal, engine
 
@@ -24,8 +32,37 @@ BATCH = 32
 
 def _ensure_table():
     """确保 movie_embeddings 表存在（建库脚本/独立运行时不经过 FastAPI 启动，
-    不会自动 create_all，这里兜底创建，已存在则跳过）。"""
+    不会自动 create_all，这里兜底创建，已存在则跳过）。
+
+    同时幂等补齐 updated_at 列：create_all 只会建缺失的表、不会 ALTER 已有表，
+    老库上的 movie_embeddings 没有该列，这里用原生 ALTER 补上（列已存在则忽略）。
+    updated_at 用 MySQL 的 ON UPDATE CURRENT_TIMESTAMP，使每次 upsert 重建都自动刷新，
+    用户可凭 SELECT MAX(updated_at) 肉眼确认「建库确实跑过、何时跑的」。
+    """
     Base.metadata.create_all(bind=engine, tables=[models.MovieEmbedding.__table__], checkfirst=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE movie_embeddings "
+                "ADD COLUMN updated_at DATETIME NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            ))
+    except Exception:  # noqa: BLE001
+        # 列已存在（1060）或方言差异 —— 忽略，不阻断建库
+        pass
+    else:
+        # ADD 首次成功（老库补列）：已带 ON UPDATE，无需再处理
+        return
+    # ADD 失败（列已存在）：旧 schema 可能建出「无 ON UPDATE」的列，补一句 MODIFY 兜底
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE movie_embeddings "
+                "MODIFY COLUMN updated_at DATETIME NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            ))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _chunk_for_movie(m: models.Movie) -> str:
@@ -53,6 +90,16 @@ def build_movie_embeddings(model_id: str | None = None) -> int:
 
     可重复运行：已存在的 movie_id 会覆盖更新（换模型后重跑即可重建索引）。
     返回处理的电影数量。
+
+    健壮性（关键，踩过坑）：
+      星火 MaaS 免费档在限流/抖动时可能【静默返回少于请求的向量】
+      （例如请求 32 条只回 28 条且不报错）。旧实现直接 zip(ids, vecs) 会被
+      截断，导致「只有前 N 部电影被更新」，且因失败静默、launcher 仍报成功，
+      极难排查（表现为 updated_at 时间簇分散、部分电影语义检索搜不到）。
+      本实现逐小批嵌入并【严格校验返回长度】：长度不符则重试整批，仍不符则
+      拆成单条逐个补齐；最终若仍有缺失则整体抛错（让 launcher 如实报「构建失败」，
+      而非悄悄只更新一部分）。commit 前对所有行统一打 build_time 戳，使一次
+      完整建库后 40 行 updated_at 完全一致，肉眼即可确认「本次覆盖全部」。
     """
     model_id = model_id or settings.embedding_model or "xop3qwen8bembedding"
     _ensure_table()
@@ -61,18 +108,46 @@ def build_movie_embeddings(model_id: str | None = None) -> int:
         movies = db.query(models.Movie).all()
         existing = {row.movie_id: row for row in db.query(models.MovieEmbedding).all()}
 
-        texts: list[str] = []
-        ids: list[int] = []
-        for m in movies:
-            texts.append(_chunk_for_movie(m))
-            ids.append(m.id)
+        texts = [_chunk_for_movie(m) for m in movies]
+        ids = [m.id for m in movies]
 
-        # 批量嵌入（受免费档限速影响时，可在调用方加重试/限速）
-        all_vecs: list[list[float]] = []
-        for i in range(0, len(texts), BATCH):
-            batch = texts[i : i + BATCH]
-            all_vecs.extend(embed_texts(batch))
+        # —— 健壮嵌入：保证 all_vecs 与 texts 等长，否则整体失败，绝不静默部分成功 ——
+        embedder = get_embedder()
+        all_vecs: list = [None] * len(texts)
+        pending = list(range(len(texts)))
+        for _round in range(4):                      # 整轮重试（应对整体限流）
+            if not pending:
+                break
+            next_pending: list[int] = []
+            for s in range(0, len(pending), BATCH):
+                seg = pending[s : s + BATCH]
+                seg_texts = [texts[i] for i in seg]
+                try:
+                    vecs = _embed_with_retry(embedder, seg_texts)
+                except Exception:                    # 整批失败 → 留到下一轮
+                    next_pending.extend(seg)
+                    continue
+                if vecs is None or len(vecs) != len(seg_texts):
+                    # 长度不符（静默截断/部分返回）→ 逐条补齐，确保不丢任何一部
+                    for i in seg:
+                        try:
+                            all_vecs[i] = _embed_with_retry(embedder, [texts[i]])[0]
+                        except Exception:
+                            next_pending.append(i)
+                    continue
+                for i, v in zip(seg, vecs):
+                    all_vecs[i] = v
+            pending = next_pending
+            if pending:
+                time.sleep(2)
+        missing = [ids[i] for i, v in enumerate(all_vecs) if v is None]
+        if missing:
+            raise RuntimeError(
+                f"建库失败：{len(missing)} 部电影嵌入未成功（疑似星火接口限流/抖动）："
+                f"movie_id={missing[:10]}{'…' if len(missing) > 10 else ''}"
+            )
 
+        build_time = datetime.datetime.now()
         for mid, vec in zip(ids, all_vecs):
             row = existing.get(mid)
             if row is None:
@@ -81,6 +156,7 @@ def build_movie_embeddings(model_id: str | None = None) -> int:
             row.embedding = vec
             row.chunk_text = _chunk_for_movie(db.get(models.Movie, mid))
             row.model = model_id
+            row.updated_at = build_time          # 统一戳：本次建库覆盖全部 40 部
 
         db.commit()
         return len(ids)

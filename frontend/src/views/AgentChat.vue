@@ -3,7 +3,7 @@ export default { name: 'AgentChat' }
 </script>
 
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, reactive, nextTick, onMounted } from 'vue'
 
 const WELCOME = {
   role: 'bot',
@@ -86,7 +86,12 @@ async function send() {
   if (!text || sending.value || !currentSid.value) return
   input.value = ''
   messages.value.push({ role: 'user', text })
-  const bot = { role: 'bot', text: '', thinking: true, waiting: false }
+  // 必须用 reactive 包裹：push 进 ref([]) 后，数组里的元素是 reactive 代理，
+  // 但此处闭包引用的 bot 仍是「原始对象」。若直接改原始对象（bot.text += …），
+  // 不会经过 proxy 的 set trap → 不触发响应式更新 → 模板一直停在初始「思考中」，
+  // 直到 finally 里 sending.value=false 触发整组件重渲染才一次性吐出全文。
+  // 用 reactive() 让 bot 本身就是代理，后续 bot.thinking/bot.text 修改才会逐字触发重渲染。
+  const bot = reactive({ role: 'bot', text: '', thinking: true, waiting: false })
   messages.value.push(bot)
   sending.value = true
   await scrollDown()

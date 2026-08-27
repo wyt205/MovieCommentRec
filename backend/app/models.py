@@ -78,6 +78,9 @@ class MovieEmbedding(Base):
     embedding = Column(JSON, comment="768 维向量")
     model = Column(String(64), comment="嵌入模型 id")
     created_at = Column(DateTime, server_default=func.now())
+    # 重建时间：每次 upsert（覆盖旧向量）都会刷新，用于肉眼确认「建库确实跑过」
+    # onupdate 双保险：即便不显式赋值，ORM 层 UPDATE 也会刷新（与 movies 表一致）
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class Reviewer(Base):
