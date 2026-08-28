@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
 )
+from sqlalchemy.dialects import mysql
 from sqlalchemy.sql import func
 
 from app.db.database import Base
@@ -57,7 +58,8 @@ class Movie(Base):
     summary = Column(Text)
     poster_url = Column(String(512))
     # 海报图片字节（不再落盘到文件夹，直接存库，国内也能正常显示）
-    poster = Column(LargeBinary)
+    # MySQL 上 LargeBinary 默认映射 BLOB(64KB)，海报常超 64KB，故在 MySQL 用 LONGBLOB(4GB)
+    poster = Column(LargeBinary().with_variant(mysql.LONGBLOB, "mysql"))
     # 数据来源（当前固定 tmdb）
     source = Column(String(16))
     # TMDb 宣传语（tagline），如「希望让人自由」

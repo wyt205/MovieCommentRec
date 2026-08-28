@@ -1,0 +1,17 @@
+# 项目根构建上下文忽略项（前端镜像 context = . 时使用）
+# 注意：必须保留 frontend/ 与 admin/（前端构建与托管需要）
+.git
+.idea
+.vscode
+__pycache__/
+*.pyc
+node_modules/
+backend/
+.run/
+sql/
+launcher.py
+README.md
+pyrightconfig.json
+Dockerfile
+docker-compose.yml
+.env

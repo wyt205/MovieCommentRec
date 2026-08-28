@@ -1,0 +1,12 @@
+# backend 构建上下文忽略项
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+.idea/
+.run/
+static/posters/
+node_modules/
+.pytest_cache/

@@ -1,0 +1,71 @@
+# 智影 (CineSage) Docker 部署
+# 三服务：mysql（库） / backend（FastAPI） / web（nginx 托管前端+管理端，并反代 API）
+#
+# 用法：
+#   1) 复制 .env.example 为 .env 并填入 LLM/嵌入/TMDb 的 key（可选，不填也能起，只是 Agent 返回"未启用"）
+#   2) docker compose up -d --build
+#   3) 浏览器打开 http://localhost        （管理端 http://localhost/admin/）
+#   4) 灌数据：docker compose exec -e TMDB_API_KEY=xxx backend python -m app.crawler.tmdb
+#      建语义向量（可选）：docker compose exec backend python build_embeddings.py
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: zhiying-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-llm_pro}
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - zhiying
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: zhiying-backend
+    restart: unless-stopped
+    # 从项目根 .env 注入环境变量（DATABASE_URL/LLM_*/EMBEDDING_*/TMDB_API_KEY 等）
+    env_file:
+      - .env
+    environment:
+      # 兜底：compose 内用 mysql 服务名连库（即使 .env 里是 localhost 也被这里覆盖）
+      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-password}@mysql:3306/${MYSQL_DATABASE:-llm_pro}?charset=utf8mb4}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8000:8000"   # 暴露给宿主机：管理端直连 / /docs 调试
+    networks:
+      - zhiying
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost}
+    container_name: zhiying-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - zhiying
+
+volumes:
+  mysql_data:
+
+networks:
+  zhiying:
+    driver: bridge
